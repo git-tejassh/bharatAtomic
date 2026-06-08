@@ -81,13 +81,16 @@ runs/
 wandb/
 tensorboard/
 
-semPhase1/
-
-# ML checkpoints
-*.pth
-*.pt
-*.ckpt
-*.onnx
+semPhase1/*.pth
+semPhase1/*.pt
+semPhase1/*.ckpt
+semPhase1/*.onnx
+semPhase1/dataset/
+semPhase1/model_weights/
+semPhase1/notebooks/images/
+semPhase1/notebooks/pix2pix/
+semPhase1/pix2pix/
+semPhase1/RDUNet_github_gurrola/
 
 # Datasets
 *.zip
