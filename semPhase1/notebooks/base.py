@@ -30,17 +30,23 @@ from NAFNet_arch import NAFNet, NAFBlock, NAFNetLocal, SimpleGate
 from local_arch import AvgPool2d , Local_Base
 import arch_util
 from pathlib import Path
+from DISTS_pytorch import DISTS
 
 
 device = torch.device('mps' if  torch.backends.mps.is_available() else 'cpu')
 psnr_metric = PeakSignalNoiseRatio(data_range=1.0)
 psnr_metric.to(device)
-
+D = DISTS().to(device)
 
 
 import os
 from PIL import Image
 import numpy as np
+
+from pytorch_msssim import ssim
+
+l1 = nn.L1Loss()
+mse_fn = nn.MSELoss()
 
 
 
@@ -81,6 +87,18 @@ def collect_images(parent_path):
     return all_images
 
 
+def load_all_data(parent_dir = '/Users/tjsss/Desktop/bharatAtomic/semPhase1/dataset/crop/images' , split = 0.7 , times = 5):
+    all_images = collect_images(parent_dir)
+    np.random.shuffle(all_images)
+    train_arrays = all_images[:int(len(all_images)*split)]
+    test_arrays = all_images[int(len(all_images)*split):]
+    noise_obj = NoiseImage()
+    train_dataset = CustomData(train_arrays, transform= transform_3(256), repeats = times , training = True , noise_obj = noise_obj)
+    test_dataset = CustomData(test_arrays , transform = transform_3(256), repeats = 1, training = False, noise_obj = noise_obj)
+
+    train_loader, val_loader, test_loader = load_data(train_dataset, test_dataset, batch_size = 4)
+    return train_loader, val_loader, test_loader
+
 
 def load_pkl(path_train , path_test):
     train_ip , train_op = pkl.load(open(path_train , 'rb'))
@@ -101,11 +119,11 @@ def augment_data(data, repeats):
     return new_data
 
 
-
 def transform_3(size):
             return A.Compose([
                 A.Resize(size, size), 
-            ])
+            ],
+            additional_targets={"output": "image"})
 
 
 def transform_1(size):
@@ -115,15 +133,24 @@ def transform_1(size):
             ],
             additional_targets={"output": "image"})
 
-from pytorch_msssim import ssim
 
-l1 = nn.L1Loss()
-mse_fn = nn.MSELoss()
+def calc_loss(pred, target,metric = 'ssim', theta=0.2):
+    if metric == 'ssim':
+        ssim_val = ssim(pred, target, data_range=1.0, size_average=True)
+        ssim_fn = (1.00-ssim_val)
+        return ((1 - theta) * l1(pred, target)) + (theta * ssim_fn)
+    elif metric =='dists':
+        dists_loss = D(pred, target, require_grad=True, batch_average=True)
+        return ((1-theta)*l1(pred, target) + (theta*dists_loss))
 
-def calc_loss(pred, target, theta=0.2):
-    ssim_val = ssim(pred, target, data_range=1.0, size_average=True)
-    ssim_fn = (1.00-ssim_val)
-    return ((1 - theta) * l1(pred, target)) + (theta * ssim_fn)
+
+def all_losses(pred, target):
+    # rmse_val = mse_fn(pred,target)
+    ssim_val = ssim(pred, target, data_range=1.0, size_average=True).item()
+    psnr_val = psnr_metric(pred, target).item()
+    dists_val = D(pred,target , batch_average = True).item()
+    return ssim_val,psnr_val,dists_val
+
 
 class NoiseImage:
     def __init__(self, prob=None):
@@ -442,6 +469,7 @@ class NoiseImage:
     def augment(self, img, seed=None):
         return self.augment_sem(img, seed=seed)
 
+
 def augment(noisy_images, repeats=5):
     """
     noisy_images: torch.Tensor of shape [N, C, H, W]
@@ -494,7 +522,6 @@ def augment(noisy_images, repeats=5):
     return out
 
 
-
 class CustomData(Dataset):
     def __init__(self, images, transform = None, repeats = 1, training = False, noise_obj = None):
         self.images = images
@@ -522,14 +549,17 @@ class CustomData(Dataset):
             y_img = np.asarray(aug["image"], dtype=np.float32)
 
         # Then: create noisy input from the augmented target
-        if self.training:
+        if self.noise_obj is not None:
             out = self.noise_obj.new_augment_sem(y_img.copy())
         else:
             x_img = y_img.copy()
 
-        x_img = out["x"]
-        y_img = out["y"]
-        noise_info = out["noise_added"]
+        noise_info = None  # default
+
+        if self.noise_obj:
+            x_img = out["x"]
+            y_img = out["y"]
+            noise_info = out.get("noise_added", None)
 
         def np_to_tensor(arr):
             arr = np.asarray(arr, dtype=np.float32)
@@ -553,9 +583,10 @@ def load_data(train_dataset, test_dataset, batch_size, val_ratio=0.2):
 
     train_subset, val_subset = random_split(train_dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, )
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, )
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,)
+    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
 
     return train_loader, val_loader, test_loader
 
@@ -567,9 +598,17 @@ def load_data(train_dataset, test_dataset, batch_size, val_ratio=0.2):
 
 import time
 
-def fineTune(model, train_loader, val_loader, num_epochs=20 , name='new_model.pth' , device = 'cpu'):
+def fineTune(model, train_loader, val_loader, num_epochs=20 , name='new_model.pth' , save_freq = 2, metric = 'ssim' , device = 'cpu'):
     model.train()
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=3,
+    min_lr=1e-7
+)
+
     x_sample, y_sample = next(iter(train_loader))
     print(f"x range: [{x_sample.min():.3f}, {x_sample.max():.3f}]")
     print(f"y range: [{y_sample.min():.3f}, {y_sample.max():.3f}]")
@@ -594,48 +633,60 @@ def fineTune(model, train_loader, val_loader, num_epochs=20 , name='new_model.pt
             x, y = x.to(device), y.to(device)
             pred = model(x)
             optimizer.zero_grad()
-            loss = calc_loss(pred, y, theta=0.4)
+            loss = calc_loss(pred, y, metric ,theta=0.4)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-            train_losses.append(loss)
-            print(f"Batch: {batch_idx+1} , loss : {loss}", end="\r")
+            train_losses.append(loss.item())
             
             if (batch_idx + 1) % 10 == 0:
-                psnr10 = psnr_metric(pred , y)
+                psnr10 = psnr_metric(pred , y).item()
                 print(f"  Batch {batch_idx + 1}/{len(train_loader)} | Loss: {loss.item():.8f} \n PSNR: {psnr10}")
                 psnr_scores_train.append(psnr10)
         
         epoch_time = time.time() - epoch_start
         print(f"Epoch {epoch+1}/{num_epochs} | Loss: {total_loss/len(train_loader):.8f} | Time: {epoch_time:.4f}s")
-        torch.save(model.state_dict(), 'rdunet_new_finetuned.pth')
+        torch.save(model.state_dict(), name)
 
         model.eval()
         with torch.no_grad():
             psnr_score = 0.0
             psnr_sum = 0.0
             val_loss_sum = 0.0
+            ssim_score_val = 0.0
+            dists_score_val = 0.0
+            psnr_metric.reset()
             for batch_idx, (x,y) in enumerate(val_loader):
                 x,y = x.to(device) , y.to(device)
                 pred = model(x)
-                val_loss = calc_loss(pred, y, theta = 0.4)
-                val_losses.append(val_loss)
-                psnr_score = psnr_metric(pred, y)
+                val_loss = calc_loss(pred, y, metric ,theta = 0.4 )
+                ssim_val, psnr_val, dists_val = all_losses(pred, y)
+                val_losses.append(val_loss.item())
+                psnr_score = psnr_metric(pred, y).item()
                 psnr_sum += psnr_score
                 psnr_scores.append(psnr_score) 
-                val_loss_sum += val_loss
+                val_loss_sum += val_loss.item()
+                ssim_score_val += ssim_val
+                dists_score_val += dists_val
+        
+                
                 
 
                 if (batch_idx + 1) % 10 == 0:
                     epochs10.append(epoch+1)
                     print(f"Batch: {batch_idx+1}/{len(val_loader)} | Val Loss: {val_loss.item():.8f}")
-            print(f"Avg Val loss: {val_loss_sum/len(val_loader):.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f}")
+                    print(f" DISTS: {dists_score_val/len(val_loader):.4f} | SSIM: {ssim_score_val/len(val_loader)}")
+            
 
-        
+            scheduler.step(val_loss_sum/len(val_loader))
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"Avg Val loss: {val_loss_sum/len(val_loader):.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f} \n lr: {current_lr}")
 
-        if (epoch % 2) == 0:
+        epochs_plotted.append(epoch+1)    
+
+        if (epoch % save_freq) == 0:
             torch.save(model.state_dict(), name)
-            epochs_plotted.append(epoch+1)
+            
 
     
     # fineTune(rdunet_model, train_loader, val_loader, num_epochs=1
@@ -660,13 +711,10 @@ def fineTune(model, train_loader, val_loader, num_epochs=20 , name='new_model.pt
     plt.plot(epochs_plotted, psnr_scores, label="PSNR", color="green", linewidth=2)
     plt.plot(epochs10, psnr_scores_train, label = "PSNR Training" , color = "orange" , linestyle = '--' , linewidth = 2 )
     plt.xlabel("Epoch")
-    plt.ylabel("PSNR (dB)")
+    plt.ylabel("PSNR (dB)") 
     plt.legend()
     plt.grid(True)
     plt.show()
-
-
-
 
 
 
@@ -702,9 +750,11 @@ def test_func(model, ip_img, transform, device='cpu'):
         loss = calc_loss(pred, y_batch, theta=0.4)
         ssim_score = ssim(pred, y_batch, data_range=1.0, size_average=True).item()
         psnr_score = psnr_metric(pred, y_batch).item()
+        ssim_val, psnr_val, dists_val = all_losses(pred, y_batch)
 
     print(f"Loss: {loss.item():.8f} | SSIM: {ssim_score:.4f}")
     print(f"PSNR: {psnr_score:.4f} dB")
+    print(f"DISTS: {dists_val:.4f}")
 
     x_vis = x_noised.cpu()[0, 0].clamp(0, 1).numpy()
     pred_vis = pred_cpu[0, 0].clamp(0, 1).numpy()
@@ -721,6 +771,12 @@ def test_func(model, ip_img, transform, device='cpu'):
     plt.figure(figsize=(5, 5))
     plt.imshow(pred_vis, cmap='gray')
     plt.title('Prediction')
+    plt.figtext(
+    0.5, 0.02,
+    f"Loss: {loss.item():.4f}, SSIM: {ssim_score:.4f}, PSNR: {psnr_score:.2f} dB",
+    ha='center', fontsize=10
+    )
+
     plt.axis('off')
     plt.show()
 
@@ -741,39 +797,47 @@ def to_1ch(x):
     return x
 
 
-def test_func_batches(model, test_loader, device='cpu'):
+def test_func_batches(model, test_loader, device='cpu', transform = None):
     model.eval()
     model.to(device)
+    psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
 
     with torch.no_grad():
         test_loss_sum = 0.0
         psnr_score = 0.0
+        rmse_val, ssim_val, dists_val = 0.0
 
-        for batch_id, (x, y) in enumerate(test_loader):
-            
+        for batch_id, (x, y) in enumerate(test_loader):        
 
             x, y = x.to(device), y.to(device)
-            if y.shape[1] == 3:
-                y = y[:, :1, :, :]
+            # if y.shape[1] == 3:
+            #     y = y[:, :1, :, :]
 
 
-            pred = model(x)
-            pred = to_1ch(pred).to(device)
+            pred = model(x).to(device)
+            # pred = to_1ch(pred).to(device)
 
-            # if model still outputs 3 channels, collapse prediction too
-            if pred.dim() == 4 and pred.shape[1] == 3:
-                pred = pred[:, :1, :, :]
+            # if pred.dim() == 4 and pred.shape[1] == 3:
+            #     pred = pred[:, :1, :, :]
 
             pred = pred.clamp(0.0, 1.0)
 
             test_loss = calc_loss(pred, y, theta=0.4)
+            ssim_val, psnr_val, dists_val = all_losses(pred, y)
+            ssim_b, psnr_b, dists_b = all_losses(pred, y)
+            
+            ssim_val += ssim_b
+            psnr_val += psnr_b
+            dists_val += dists_b
+
             test_loss_sum += test_loss.item()
             psnr_score += psnr_metric(pred, y).item()
 
             if (batch_id + 1) % 10 == 0:
                 print(
                     f"Average Test Loss till batch: {batch_id+1} = {test_loss_sum/(batch_id+1):.8f}\n"
-                    f"Average PSNR score : {psnr_score/(batch_id+1):.8f}"
+                    f"Average PSNR score : {psnr_score/(batch_id+1):.8f}\n"
+                    f"SSIM: {ssim_val/(batch_id+1):.4f} |  DISTS: {dists_val/(batch_id+1):.4f}"
                 )
 
             

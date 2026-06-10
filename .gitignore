@@ -1,97 +1,71 @@
-/Users/tjsss/Desktop/bharatAtomic/bA/dataset/
-/Users/tjsss/Desktop/bharatAtomic/semPhase1/NAFNet_github_megvii/
-/Users/tjsss/Desktop/bharatAtomic/semPhase1/RDUNet_github_gurrola/
-/Users/tjsss/Desktop/bharatAtomic/semPhase1/model_weights/
-
-# Ignore the virtual environment
-bA/
-
-# Ignore the specific model weights folder
-semPhase1/model_weights/
-
-*.pkl
-*.jpg
-
-
-# Ignore large dataset files inside notebooks
-semPhase1/notebooks/*.pt
-
-semPhase1/notebooks/NAFNet/
-# Ignore OS-specific system files
-.DS_Store
-semPhase1/.DS_Store
-
-# Ignore virtual environment completely
-bA/
-
-# Ignore dataset archives and weights
-*.zip
-semPhase1/model_weights/
-semPhase1/notebooks/*.pt
-
-# Ignore system junk files
+# =========================
+# OS files
+# =========================
 .DS_Store
 **/.DS_Store
 
-semPhase1/NAFNet_github_megvii/
-semPhase1/RDUNet_github_gurrola/
-
-
-
-
-CLAUDE.md
-get-pip.py
-
-/Users/tjsss/Desktop/bharatAtomic/papers
-*.pdf
-*.pt
-*.jpg
-
-/.claude
-/papers
-/dataset
-./semPhase1/notebooks/*.pt
-
+# =========================
 # Python
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
 
-# Virtual envs
+# =========================
+# Virtual environments
+# =========================
+bA/
 venv/
 env/
-bA/
+.venv/
 
-# ML checkpoints
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# ML model checkpoints
+# =========================
 *.pth
 *.pt
 *.ckpt
 *.onnx
 
-# Datasets
+# =========================
+# Datasets & archives
+# =========================
 *.zip
 *.pkl
+*.pdf
+*.jpg
+*.jpeg
+*.png
+
+dataset/
 datasets/
 data/
+papers/
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Logs
+# =========================
+# Experiment outputs
+# =========================
 runs/
 wandb/
 tensorboard/
 
-semPhase1/*.pth
-semPhase1/*.pt
-semPhase1/*.ckpt
-semPhase1/*.onnx
+# =========================
+# Project-specific large folders
+# =========================
 semPhase1/dataset/
 semPhase1/model_weights/
 semPhase1/notebooks/images/
 semPhase1/notebooks/pix2pix/
 semPhase1/pix2pix/
+
+# External repositories
+semPhase1/NAFNet_github_megvii/
 semPhase1/RDUNet_github_gurrola/
 
-# Datasets
-*.zip
-*.pkl
+# Claude
+.claude/
