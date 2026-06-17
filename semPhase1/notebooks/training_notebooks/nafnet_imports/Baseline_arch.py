@@ -10,7 +10,7 @@ Simple Baselines for Image Restoration
   author={Chen, Liangyu and Chu, Xiaojie and Zhang, Xiangyu and Sun, Jian},
   journal={arXiv preprint arXiv:2204.04676},
   year={2022}
-}
+} 
 '''
 
 import torch

@@ -1012,7 +1012,7 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
             avg_val_loss = val_loss_sum / len(val_loader)
             scheduler.step(avg_val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Avg Val loss: {avg_val_loss:.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f} \n lr: {current_lr} \n Avg DISTS Score: {dists_score_val_list/len(val_loader):.8f} \n Avg SSIM Score: {ssim_score_val_list/len(val_loader):.8f}")
+            print(f"Avg Val loss: {avg_val_loss:.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f} \n lr: {current_lr} \n Avg DISTS Score: {dists_score_val_sum/len(val_loader):.8f} \n Avg SSIM Score: {ssim_score_val_sum/len(val_loader):.8f}")
 
             for ssim in ssim_score_val:
                 ssim_val_epoch= ssim
@@ -1038,8 +1038,8 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
         epoch_train_losses.append(total_loss / len(train_loader))
         epoch_val_losses.append(avg_val_loss)
 
-        if (epoch % save_freq) == 0:
-            torch.save(model.state_dict(), name)
+        if ((epoch+1) % save_freq) == 0:
+            torch.save({'epoch' : epoch+1 , 'model_state_dict': model.state_dict(), 'optimizer_state_dict' : optimizer.state_dict()}, name)
             
 
     
