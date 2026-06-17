@@ -709,8 +709,8 @@ class NoiseImage:
         rng = np.random.default_rng(seed)
         perm = rng.permutation(n)
 
-        cut1 = int(n * 0.40)
-        cut2 = int(n * 0.70)  # 0.40 + 0.30
+        cut1 = int(n * 0.30)
+        cut2 = int(n * 0.60)  # 0.30 + 0.40
 
         normal_idx = perm[:cut1]
         mid_idx    = perm[cut1:cut2]
@@ -791,12 +791,14 @@ def augment(noisy_images, repeats=5):
 
 
 class CustomData(Dataset):
-    def __init__(self, images, transform = None, repeats = 1, training = False, noise_obj = None):
+    def __init__(self, images, transform = None, repeats = 1, training = False, noise_obj = None, aug_assignment = None):
         self.images = images
         self.transform = transform
         self.repeats = repeats
         self.training = training
         self.noise_obj = noise_obj if noise_obj is not None else NoiseImage()
+        self.aug_assignment = aug_assignment if aug_assignment is not None else \
+            self.noise_obj.build_augmentation_split(self.images, seed=42)
         if transform == transform_1:
             self.transform_type = 'transform_1'  # Grayscale (C=1)
         else:
@@ -824,9 +826,13 @@ class CustomData(Dataset):
 
         # Then: create noisy input from the augmented target
         if self.noise_obj is not None:
-            out = self.noise_obj.augment_3way_sem(y_img.copy())
+            out = self.noise_obj.augment_3way_sem(y_img.copy(),
+                idx=img_idx,
+                assignment=self.aug_assignment,
+                seed=int(idx))
         else:
             x_img = y_img.copy()
+            out = {"x": x_img, "y": y_img, "noise_added": None}
 
         noise_info = None  # default
 
@@ -896,13 +902,24 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
     psnr_scores, psnr_scores_train = [], []
     dists_scores, dists_scores_train = [], []
     epoch_train_losses, epoch_val_losses = [] , []
+    dists_score_val, ssim_score_val = [],[]
     ssim_scores = []
+    epochs_dists_train, epochs_dists_val , epochs_ssim_train ,epochs_ssim_val = [],[],[],[]
+    psnr_train_epochs, dists_train_epochs = [], []
+    ssim_val_epochs, dists_val_epochs = [], []
+
+
 
     ## EPOCH
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
         epoch_start = time.time()
+        
+        psnr_train_epoch= dists_train_epoch = 0.0
+        ssim_val_epoch = dists_val_epoch = 0.0
+
+    
 
     ## TRAINING     
         for batch_idx, (x, y) in enumerate(train_loader):
@@ -936,12 +953,22 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
         print(f"Epoch {epoch+1}/{num_epochs} | Loss: {total_loss/len(train_loader):.8f} | Time: {epoch_time:.4f}s")
         torch.save(model.state_dict(), name)
 
+
+        for psnr in psnr_scores_train:
+            psnr_train_epoch+= psnr
+        psnr_train_epochs.append((psnr_train_epoch)*10/len(train_loader))
+        for dists in dists_scores_train:
+            dists_train_epoch += dists
+        dists_train_epochs.append((dists_train_epoch)*10/(len(train_loader)))
+
     ## EVALUATION
         model.eval()
         channels = int(x_sample.shape[1])
         with torch.no_grad():
-            psnr_sum = val_loss_sum = ssim_score_val = dists_score_val = 0.0
+            psnr_sum = val_loss_sum = ssim_score_val_sum = dists_score_val_sum = 0.0
             ssim_score_10 = dists_score_10 = 0.0
+            dists_score_val_list = []
+            ssim_score_val_list = []
             psnr_metric.reset()
 
             for batch_idx, (x,y) in enumerate(val_loader):
@@ -953,13 +980,10 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
                 else:
                     pred = model(x).clamp(0, 1)
 
+
                 pred_f, y_f = pred.float(), y.float()
                 val_loss = calc_loss(pred_f, y_f, metric, theta)
                 ssim_val, psnr_val, dists_val = all_losses(pred_f, y_f ,train = False ,c = channels)
-
-
-                val_loss = calc_loss(pred, y, metric ,theta )
-                ssim_val, psnr_val, dists_val = all_losses(pred, y, train = False , c=channels)
                 val_losses.append(val_loss.item())
                 psnr_score = psnr_val
                 psnr_sum += psnr_score
@@ -967,28 +991,50 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
                 dists_scores.append(dists_val)
                 ssim_scores.append(ssim_val)
                 val_loss_sum += val_loss.item()
-                ssim_score_val += ssim_val
-                dists_score_val += dists_val
+                ssim_score_val_sum += ssim_val
+                dists_score_val_sum += dists_val
                 dists_score_10 += dists_val
                 ssim_score_10 += ssim_val
 
         
                 
-                
+                 
 
                 if (batch_idx + 1) % 10 == 0:
                     epochs10.append(epoch+1)
                     print(f"Batch: {batch_idx+1}/{len(val_loader)} | Val Loss: {val_loss.item():.8f}")
-                    print(f" DISTS: {dists_score_10/10:.4f} | SSIM: {ssim_score_10/10:.4f}")
+                    print(f" DISTS: {(dists_score_10/10):.4f} | SSIM: {(ssim_score_10/10):.4f}")
+                    dists_score_val_list.append((dists_score_10/10))
+                    ssim_score_val_list.append((ssim_score_10/10))
+                    dists_score_10 = 0 
                     ssim_score_10 = 0
-                    dists_score_10 = 0
             
             avg_val_loss = val_loss_sum / len(val_loader)
             scheduler.step(avg_val_loss)
             current_lr = optimizer.param_groups[0]["lr"]
-            print(f"Avg Val loss: {avg_val_loss:.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f} \n lr: {current_lr} \n Avg DISTS Score: {dists_score_val/len(val_loader):.8f} \n Avg SSIM Score: {ssim_score_val/len(val_loader):.8f}")
+            print(f"Avg Val loss: {avg_val_loss:.8f} \n Avg PSNR Score: {psnr_sum/len(val_loader):.8f} \n lr: {current_lr} \n Avg DISTS Score: {dists_score_val_list/len(val_loader):.8f} \n Avg SSIM Score: {ssim_score_val_list/len(val_loader):.8f}")
 
+            for ssim in ssim_score_val:
+                ssim_val_epoch= ssim
+            ssim_val_epochs.append((ssim_score_val_sum)/len(val_loader))
+            
+        
+            for dists in dists_score_val:
+                dists_val_epoch+= dists
+            dists_val_epochs.append((dists_score_val_sum)/(len(val_loader)))
+            
+        
         epochs_plotted.append(epoch+1)   
+        epochs_dists_val.append(dists_val_epochs)
+        
+
+
+        
+        
+        
+
+
+        
         epoch_train_losses.append(total_loss / len(train_loader))
         epoch_val_losses.append(avg_val_loss)
 
@@ -1017,16 +1063,22 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
     plt.grid(True)
     plt.show()
 
-    plt.plot(epochs_plotted, psnr_scores, label="PSNR", color="green", linewidth=2)
-    plt.plot(epochs10, psnr_scores_train, label = "PSNR Training" , color = "orange" , linestyle = '--' , linewidth = 2 )
+    plt.plot(epochs_plotted, psnr_train_epochs, label="PSNR - Training", color="green", linewidth=2)
     plt.xlabel("Epoch")
     plt.ylabel("PSNR (dB)") 
     plt.legend()
     plt.grid(True)
     plt.show()
 
-    plt.plot(epochs_plotted, dists_scores, label="DISTS VAL", color="blue" , linestyle = "--" , linewidth = 2 )
-    plt.plot(epochs_plotted, ssim_scores, label="SSIM VAL", color="red", linewidth = 2)
+    plt.plot(epochs_plotted, dists_val_epochs, label="DISTS VAL", color="blue" , linestyle = "--" , linewidth = 2 )
+    plt.plot(epochs_plotted, dists_train_epochs, label="DISTS TRAIN", color="red", linewidth = 2)
+    plt.xlabel("Epoch")
+    plt.ylabel("Scores")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    plt.plot(epochs_plotted, ssim_val_epochs, label="SSIM VAL", color="blue" , linestyle = "--" , linewidth = 2 )
     plt.xlabel("Epoch")
     plt.ylabel("Scores")
     plt.legend()
