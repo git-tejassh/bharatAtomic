@@ -12,7 +12,6 @@ fine tune function
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# from models.rdunet import RDUNet 
 import pickle as pkl
 import numpy as np
 import matplotlib.pyplot as plt
@@ -31,6 +30,8 @@ from semPhase1.notebooks.training_notebooks.nafnet_imports.local_arch import Avg
 import semPhase1.notebooks.training_notebooks.nafnet_imports.arch_util as arch_util
 from pathlib import Path
 from DISTS_pytorch import DISTS
+
+
 from torchmetrics.functional.image.dists import deep_image_structure_and_texture_similarity as dists_fn
 torch.amp.autocast(device_type="mps")
 
@@ -91,19 +92,6 @@ def collect_images(parent_path):
         print(f"Type of the first image: {type(all_images[0])}")
 
     return all_images
-
-
-def load_all_data(parent_dir = '/Users/tjsss/Desktop/bharatAtomic/semPhase1/dataset/crop/images' , split = 0.7 , times = 5):
-    all_images = collect_images(parent_dir)
-    np.random.shuffle(all_images)
-    train_arrays = all_images[:int(len(all_images)*split)]
-    test_arrays = all_images[int(len(all_images)*split):]
-    noise_obj = NoiseImage()
-    train_dataset = CustomData(train_arrays, transform= transform_3(256), repeats = times , training = True , noise_obj = noise_obj)
-    test_dataset = CustomData(test_arrays , transform = transform_3(256), repeats = 1, training = False, noise_obj = noise_obj)
-
-    train_loader, val_loader, test_loader = load_data(train_dataset, test_dataset, batch_size = 4)
-    return train_loader, val_loader, test_loader
 
 
 def load_pkl(path_train , path_test):
@@ -791,7 +779,7 @@ def augment(noisy_images, repeats=5):
 
 
 class CustomData(Dataset):
-    def __init__(self, images, transform = None, repeats = 1, training = False, noise_obj = None, aug_assignment = None):
+    def __init__(self, images, transform = None, repeats = 1, training = False, noise_obj = None, aug_assignment = None, channels = None):
         self.images = images
         self.transform = transform
         self.repeats = repeats
@@ -799,10 +787,19 @@ class CustomData(Dataset):
         self.noise_obj = noise_obj if noise_obj is not None else NoiseImage()
         self.aug_assignment = aug_assignment if aug_assignment is not None else \
             self.noise_obj.build_augmentation_split(self.images, seed=42)
-        if transform == transform_1:
-            self.transform_type = 'transform_1'  # Grayscale (C=1)
+        
+        if channels is not None:
+            # Explicit override wins
+            detected_channels = channels
         else:
-            self.transform_type = 'transform_3'  # RGB (C=3)
+            # Auto-detect: run transform on a sample image and inspect the result
+            sample = np.asarray(self.images[0], dtype=np.float32) / 255.0
+            if self.transform is not None:
+                sample = np.asarray(self.transform(image=sample)["image"], dtype=np.float32)
+            detected_channels = 1 if sample.ndim == 2 else sample.shape[-1]
+
+        self.channels = detected_channels
+        self.transform_type = 'transform_1' if detected_channels == 1 else 'transform_3'
 
 
 
@@ -854,7 +851,27 @@ class CustomData(Dataset):
         y = np_to_tensor(y_img)
 
         return x, y
-    
+
+
+def load_all_data(parent_dir = '/Users/tjsss/Desktop/bharatAtomic/semPhase1/dataset/crop/images' , split = 0.7 , times = 5 ,transform = None ,channels = None, size = 256):
+    all_images = collect_images(parent_dir)
+    np.random.shuffle(all_images)
+    train_arrays = all_images[:int(len(all_images)*split)]
+    test_arrays = all_images[int(len(all_images)*split):]
+    noise_obj = NoiseImage()
+    if transform is None:
+        transform = transform_3(size)
+
+    train_dataset = CustomData(train_arrays, transform=transform, repeats=times,
+                                training=True, noise_obj=noise_obj, channels=channels)
+    test_dataset = CustomData(test_arrays, transform=transform, repeats=1,
+                               training=False, noise_obj=noise_obj, channels=channels)
+
+    train_loader, val_loader, test_loader = load_data(train_dataset, test_dataset, batch_size=4)
+    return train_loader, val_loader, test_loader
+
+
+
 
 def load_data(train_dataset, test_dataset, batch_size, val_ratio=0.2):
     n = len(train_dataset)
@@ -1248,8 +1265,3 @@ def test_func_batches(model, test_loader, device='cpu', transform = None):
 
             
  
-
-import torch
-import albumentations as A
-import numpy as np
-

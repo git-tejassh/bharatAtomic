@@ -79,14 +79,13 @@ Given the constraints, a two-track approach is the most defensible:
 This mirrors what several of the papers above already did in practice — using YOLO for the fast, deployed detector and SAM as either a refinement step or an annotation accelerator, not as competing alternatives.
 
 A reasonable evaluation matrix going into experiments:
-|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-|               Model                   |                      Expected role                                |                        Target metric                          |
-|---------------------------------------|-------------------------------------------------------------------|---------------------------------------------------------------|
-|      YOLO11n-seg / YOLOv8n-seg        |               Fastest, deployment baseline                        |                   Latency under load, mAP-mask                |
-|      YOLO11s-seg / YOLOv8s-seg        |              Accuracy/speed middle ground                         |                mAP-mask, latency headroom under 40ms          |
-| Fine-tuned SAM2 (ViT-B, decoder-only) |         Quality reference / pseudo-label generator                |     mAP-mask, Dice/IoU on hard cases (overlapping particles)  |
-|     (Optional) FastSAM/MobileSAM      |       Lightweight SAM alternative for direct comparison           |           Latency vs. YOLO-seg on identical hardware          |
-|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+
+| Model | Expected role | Target metric |
+|---|---|---|
+| YOLO11n-seg / YOLOv8n-seg | Fastest, deployment baseline | Latency under load, mAP-mask |
+| YOLO11s-seg / YOLOv8s-seg | Accuracy/speed middle ground | mAP-mask, latency headroom under 40ms |
+| Fine-tuned SAM2 (ViT-B, decoder-only) | Quality reference / pseudo-label generator | mAP-mask, Dice/IoU on hard cases (overlapping particles) |
+| (Optional) FastSAM/MobileSAM | Lightweight SAM alternative for direct comparison | Latency vs. YOLO-seg on identical hardware |
 
 ---
 
@@ -133,12 +132,12 @@ Given the annotation gap, a realistic dataset-building path, roughly in the orde
 
 ### 5.4 Annotation scale targets, summarized
 
-| Stage                                      | Approx. scale (from precedent)               | Source                                                                  |
-|--------------------------------------------|----------------------------------------------|-------------------------------------------------------------------------|
-| Self-supervised backbone pretraining       | ~20,000–25,000 unlabeled images              | Full NFFA-Europe pool; precedent from self-supervised SEM particle work |
-| Seed annotated set (manual + SAM-assisted) | 200–250 images, ~10,000–13,000 masks         | LBMS-SAM scale                                                          |
-| Pseudo-labeled expansion                   | 5% manual / 95% pseudo-labeled, spot-checked | SwinTCN-Seg / YOLOv8+SAM pattern                                        |
-| Synthetic augmentation                     | As large as needed                           | Reuse Phase 1's `NoiseImage` engine on clean references                 |
+| Stage | Approx. scale (from precedent) | Source |
+|---|---|---|
+| Self-supervised backbone pretraining | ~20,000–25,000 unlabeled images | Full NFFA-Europe pool; precedent from self-supervised SEM particle work |
+| Seed annotated set (manual + SAM-assisted) | 200–250 images, ~10,000–13,000 masks | LBMS-SAM scale |
+| Pseudo-labeled expansion | 5% manual / 95% pseudo-labeled, spot-checked | SwinTCN-Seg / YOLOv8+SAM pattern |
+| Synthetic augmentation | As large as needed | Reuse Phase 1's `NoiseImage` engine on clean references |
 
 ---
 
