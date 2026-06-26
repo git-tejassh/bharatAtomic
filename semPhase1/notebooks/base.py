@@ -991,8 +991,12 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
                     psnr10 = psnr_metric(pred , y).item()
 
                 print(f"  Batch {batch_idx + 1}/{len(train_loader)} | Loss: {loss.item():.8f} \n PSNR: {psnr10} | DISTS: {dists_t}")
-                psnr_scores_train.append(psnr10)
-                dists_scores_train.append(dists_t)
+                n_samples = len(psnr_scores_train)  # actual number of samples collected
+                psnr_train_epochs.append(sum(psnr_scores_train) / n_samples if n_samples > 0 else 0)
+                dists_train_epochs.append(sum(float(d) for d in dists_scores_train) / n_samples if n_samples > 0 else 0)
+                psnr_scores_train.clear()
+                dists_scores_train.clear()
+
         
 
         epoch_time = time.time() - epoch_start
@@ -1062,12 +1066,12 @@ def fineTune(model, train_loader, val_loader, num_epochs=20, theta = 0.4 , name=
 
             for ssim in ssim_score_val:
                 ssim_val_epoch= ssim
-            ssim_val_epochs.append((ssim_score_val_sum)/len(val_loader))
+            ssim_val_epochs.append(ssim_score_val_sum / len(val_loader))
             
         
             for dists in dists_score_val:
                 dists_val_epoch+= dists
-            dists_val_epochs.append((dists_score_val_sum)/(len(val_loader)))
+            dists_val_epochs.append(dists_score_val_sum / len(val_loader))
             
         
         epochs_plotted.append(epoch+1)   

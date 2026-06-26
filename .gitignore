@@ -15,9 +15,11 @@ __pycache__/
 # Virtual environments
 # =========================
 bA/
+venv310/
 venv/
 env/
 .venv/
+.env
 
 # =========================
 # Jupyter
@@ -46,6 +48,8 @@ dataset/
 datasets/
 data/
 papers/
+masked_dataset/
+PerovSegNet-Dataset/
 
 # =========================
 # Experiment outputs
@@ -67,6 +71,12 @@ semPhase2/PerovSegNet-Dataset
 # External repositories
 semPhase1/NAFNet_github_megvii/
 semPhase1/RDUNet_github_gurrola/
+semPhase2/masked_dataset/
+semPhase2/PerovSegNet-Dataset/
+semPhase2/SAMmodel/
+semPhase2/label_studio/
+semPhase2/papers/
+semPhase2/stuff
 
 # Claude
 .claude/
