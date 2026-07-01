@@ -288,7 +288,7 @@ class SAM2ImagePredictor:
             point_coords, point_labels, box, mask_input, normalize_coords
         )
 
-        masks, iou_predictions, low_res_masks = self._predict(
+        masks, iou_predictions, low_res_masks, to_fuse_from_sam, output_tokens = self._predict(
             unnorm_coords,
             labels,
             unnorm_box,
@@ -300,7 +300,7 @@ class SAM2ImagePredictor:
         masks_np = masks.squeeze(0).float().detach().cpu().numpy()
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
-        return masks_np, iou_predictions_np, low_res_masks_np
+        return masks_np, iou_predictions_np, low_res_masks_np, to_fuse_from_sam, output_tokens
 
     def _prep_prompts(
         self, point_coords, point_labels, box, mask_logits, normalize_coords, img_idx=-1
@@ -417,7 +417,7 @@ class SAM2ImagePredictor:
             feat_level[img_idx].unsqueeze(0)
             for feat_level in self._features["high_res_feats"]
         ]
-        low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
+        low_res_masks, iou_predictions, _, _ , to_fuse_from_sam, output_tokens = self.model.sam_mask_decoder(
             image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
             image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
@@ -435,7 +435,7 @@ class SAM2ImagePredictor:
         if not return_logits:
             masks = masks > self.mask_threshold
 
-        return masks, iou_predictions, low_res_masks
+        return masks, iou_predictions, low_res_masks, to_fuse_from_sam, output_tokens
 
     def get_image_embedding(self) -> torch.Tensor:
         """

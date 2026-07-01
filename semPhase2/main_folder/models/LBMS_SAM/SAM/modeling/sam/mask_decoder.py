@@ -144,7 +144,7 @@ class MaskDecoder(nn.Module):
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
         """
-        masks, iou_pred, mask_tokens_out, object_score_logits, mask_feat = self.predict_masks(
+        masks, iou_pred, mask_tokens_out, object_score_logits, mask_feat, output_tokens = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -178,7 +178,8 @@ class MaskDecoder(nn.Module):
                             iou_pred=iou_pred,
                             sam_tokens_out=sam_tokens_out,
                             object_score_logits=object_score_logits,
-                            mask_feat=mask_feat)
+                            mask_feat=mask_feat,
+                            output_tokens = output_tokens)
 
 
     def predict_masks(
@@ -229,6 +230,7 @@ class MaskDecoder(nn.Module):
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+        output_token = mask_tokens_out
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
@@ -260,7 +262,7 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits, to_fuse_from_sam
+        return masks, iou_pred, mask_tokens_out, object_score_logits, to_fuse_from_sam, output_token
 
     def _get_stability_scores(self, mask_logits):
         """

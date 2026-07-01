@@ -15,6 +15,7 @@ from PIL.Image import Image
 from SAM.modeling.sam2_base import SAM2Base
 
 from SAM.utils.transforms import SAM2Transforms
+from SAM.modeling.backbones.image_encoder import ImageEncoder
 
 
 class SAM2ImagePredictor:

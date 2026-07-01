@@ -8,3 +8,5 @@ albumentations
 pytorch-msssim
 torchmetrics
 DISTS-pytorch
+omegaconf
+hydra-core

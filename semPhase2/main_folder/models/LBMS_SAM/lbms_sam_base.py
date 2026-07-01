@@ -321,44 +321,38 @@ class MDFF(nn.Module):
 
 class FeatureFusion(nn.Module):
     """
-    Combines: (mask_feat * output_token) [SAM side] with
-              (denoised_feat * edge_feat) [LBMS side]
-    via concatenation + conv mixing, then upsamples to full mask resolution.
+    Fuses mask_feat (SAM), denoised_feat (MDFF), edge_feat (GSEFE) into one
+    spatial map, then applies SAM's own dynamic-weight dot product using the
+    SAME output token (passed through its hypernetwork MLP) that SAM uses
+    for its own mask — per the LBMS-SAM diagram.
     """
-
-    def __init__(self, channels: int = 256, out_channels: int = 1):
+    def __init__(self, mask_feat_channels: int, token_dim: int = 256):
         super().__init__()
+        # mix mask_feat + denoised_feat + edge_feat -> single fused map
         self.mix = nn.Sequential(
-            nn.Conv2d(2 * channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(mask_feat_channels * 3, mask_feat_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mask_feat_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels // 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(channels // 2),
+            nn.Conv2d(mask_feat_channels, mask_feat_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mask_feat_channels),
             nn.ReLU(inplace=True),
         )
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(channels // 2, 64, kernel_size=2, stride=2),
+        # SAM's hypernetwork: token -> per-mask dynamic weight vector
+        self.token_mlp = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, out_channels, kernel_size=1),
+            nn.Linear(token_dim, mask_feat_channels),
         )
 
-    def forward(
-        self,
-        mask_feat: torch.Tensor,
-        output_token: torch.Tensor,
-        denoised_feat: torch.Tensor,
-        edge_feat: torch.Tensor,
-    ) -> torch.Tensor:
-        if output_token.ndim == 2:
-            output_token = output_token.unsqueeze(-1).unsqueeze(-1)
-        token = output_token.expand_as(mask_feat)
-        sam_side = mask_feat * token            # point-wise product, SAM branch
-        lbms_side = denoised_feat * edge_feat    # point-wise product, LBMS branch
-        fused = torch.cat([sam_side, lbms_side], dim=1)
-        x = self.mix(fused)
-        return self.upsample(x)
+    def forward(self, mask_feat, denoised_feat, edge_feat, output_token):
+        # all three spatial inputs must already match mask_feat's H, W, C
+        # (resizing/projection happens upstream, NOT here)
+        fused = torch.cat([mask_feat, denoised_feat, edge_feat], dim=1)
+        fused = self.mix(fused)                    # (B, C, H, W)
+
+        weights = self.token_mlp(output_token)      # (B, C)
+        mask = torch.einsum('bchw,bc->bhw', fused, weights)  # channel-contracting dot product
+        return mask  # (B, H, W) — already at mask_feat's resolution, no upsampling needed
 
 
 class LBMSSamHead(nn.Module):
@@ -388,12 +382,7 @@ class LBMSSamHead(nn.Module):
         mask_feat: torch.Tensor,
         output_token: torch.Tensor,
     ) -> torch.Tensor:
-        edge_feat = self.gsefe(image)
-        denoised_feat = self.mdff(ga_features)
-
-        target = mask_feat.shape[-2:]
-        edge_feat = _resize_like(edge_feat, target)
-        denoised_feat = _resize_like(denoised_feat, target)
+        fused_block = torch.cat([self.mask_feat(image), self.mdff(ga_features), self.gsefe(image)], dim=1)
 
         return self.fusion(mask_feat, output_token, denoised_feat, edge_feat)
 
