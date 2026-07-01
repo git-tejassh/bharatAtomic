@@ -365,7 +365,7 @@ class LBMSSamHead(nn.Module):
 
     def __init__(
         self,
-        ga_in_dims: Sequence[int],
+        ga_in_dims:Sequence[int],
         image_channels: int = 3,
         latent_channels: int = 256,
         mdff_target_size: Optional[Tuple[int, int]] = None,
@@ -373,7 +373,7 @@ class LBMSSamHead(nn.Module):
         super().__init__()
         self.gsefe = GSEFE(in_channels=image_channels, out_channels=latent_channels)
         self.mdff = MDFF(in_dims=ga_in_dims, out_channels=latent_channels, target_size=mdff_target_size)
-        self.fusion = FeatureFusion(channels=latent_channels, out_channels=1)
+        self.fusion = FeatureFusion(mask_feat_channels=latent_channels, token_dim=latent_channels)
 
     def forward(
         self,
@@ -382,7 +382,9 @@ class LBMSSamHead(nn.Module):
         mask_feat: torch.Tensor,
         output_token: torch.Tensor,
     ) -> torch.Tensor:
-        fused_block = torch.cat([self.mask_feat(image), self.mdff(ga_features), self.gsefe(image)], dim=1)
+        self.mdff
+        denoised_feat = self.mdff(ga_features)
+        edge_feat = self.gsefe(image)
 
         return self.fusion(mask_feat, output_token, denoised_feat, edge_feat)
 
