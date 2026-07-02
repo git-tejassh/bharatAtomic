@@ -1,6 +1,4 @@
 """
-GSEFE + MDFF rebuilt against the actual LBMS-SAM architecture diagram
-(Screenshot_2026-06-30_at_12_20_27_PM.png), not against memory or guesswork.
 
 WHAT CHANGED FROM THE EARLIER lbms_sam_base.py
 ------------------------------------------------
@@ -46,12 +44,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _to_channel_first(x: torch.Tensor) -> torch.Tensor:
-    """Convert (B, H, W, C) tensors to (B, C, H, W) if needed (Hiera emits BHWC)."""
+def _check_channel_first(x: torch.Tensor) -> torch.Tensor:
+    """
+    Validate a GA branch tensor is already (B, C, H, W).
+
+    NOTE: this used to be a heuristic reformatter (`_to_channel_first`) that
+    guessed BHWC-vs-BCHW by comparing x.shape[-1] against x.shape[1] and
+    permuting if the last dim looked smaller. That heuristic is WRONG for
+    this codebase: hieradet.py's Hiera.forward() already permutes every
+    stage output to (B, C, H, W) internally (`feats = x.permute(0, 3, 1, 2)`,
+    hieradet.py line 296) before returning it. Once channel count exceeds
+    spatial resolution -- which happens by Hiera's 2nd stage (e.g. 224
+    channels at 128x128) -- the old heuristic misread an already-correct
+    BCHW tensor as BHWC and silently permuted it into a broken shape. This
+    was caught by testing MDFF against real Hiera-shaped tensors, not by
+    inspection -- it would have corrupted training silently otherwise.
+
+    Trunk output format is a known, source-confirmed fact, not something to
+    infer per-tensor. If you ever swap backbones, update this assumption
+    explicitly rather than reintroducing a shape-guessing heuristic.
+    """
     if x.ndim != 4:
         raise ValueError(f"Expected 4D tensor, got shape {tuple(x.shape)}")
-    if x.shape[-1] < x.shape[1]:
-        return x.permute(0, 3, 1, 2).contiguous()
     return x
 
 
@@ -274,7 +288,7 @@ class MDFF(nn.Module):
                 f"{len(ga_features)} at forward()."
             )
 
-        ga_cf = [_to_channel_first(x) for x in ga_features]
+        ga_cf = [_check_channel_first(x) for x in ga_features]
         target = self.target_size or ga_cf[0].shape[-2:]
 
         # Project each branch to common width, resize to common spatial
@@ -382,11 +396,27 @@ class LBMSSamHead(nn.Module):
         mask_feat: torch.Tensor,
         output_token: torch.Tensor,
     ) -> torch.Tensor:
-        self.mdff
+        # (previously: a stray `self.mdff` line here did nothing -- removed)
         denoised_feat = self.mdff(ga_features)
         edge_feat = self.gsefe(image)
 
-        return self.fusion(mask_feat, output_token, denoised_feat, edge_feat)
+        target_hw = mask_feat.shape[-2:]
+        if denoised_feat.shape[-2:] != target_hw:
+            denoised_feat = F.interpolate(
+                denoised_feat, size=target_hw, mode="bilinear", align_corners=False
+            )
+        if edge_feat.shape[-2:] != target_hw:
+            edge_feat = F.interpolate(
+                edge_feat, size=target_hw, mode="bilinear", align_corners=False
+            )
+
+        # FIX: FeatureFusion.forward's real signature is
+        # (mask_feat, denoised_feat, edge_feat, output_token). The old call
+        # passed (mask_feat, output_token, denoised_feat, edge_feat) --
+        # output_token (shape (B, C)) would have landed in the denoised_feat
+        # slot expecting (B, C, H, W), which would crash torch.cat the first
+        # time this class was actually used.
+        return self.fusion(mask_feat, denoised_feat, edge_feat, output_token)
 
 
 __all__ = [
