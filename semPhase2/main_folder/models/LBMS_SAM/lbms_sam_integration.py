@@ -6,6 +6,9 @@ from lbms_sam_base import GSEFE , MDFF, FeatureFusion
 from SAM.modeling.sam2_base import SAM2Base
 from SAM.sam2_image_predictor import SAM2ImagePredictor
 import SAM.modeling.backbones.image_encoder as img_enc
+from SAM.modeling.sam2_utils import MLP
+from SAM.modeling.backbones.image_encoder import ImageEncoder as image_encoder
+from SAM.modeling.sam.mask_decoder import MaskDecoder as mask_decoder
 
 
 MASK_FEAT_CHANNELS = 32
@@ -17,13 +20,31 @@ class LBMSSAM2Integration(nn.Module):
         sam2_model,
         token_dim: int = 256,
         ga_in_dims: list = None,
-        mask_feat_channels: int = MASK_FEAT_CHANNELS,):
+        mask_feat_channels: int = MASK_FEAT_CHANNELS,
+        iou_head_depth: int = 3,
+        iou_head_hidden_dim: int = 256,
+        iou_prediction_use_sigmoid=False,
+        transformer_dim: int = 256,
+        num_multimask_outputs: int = 3,
+        ):
+        
         
         super().__init__()
         self.sam2 = SAM2ImagePredictor(sam2_model)
         self.token_dim = token_dim
         self.mask_feat_channels = mask_feat_channels
+        self.num_multimask_outputs = num_multimask_outputs
+        self.num_mask_tokens = num_multimask_outputs + 1  # +1 for the single-mask token
 
+
+
+        self.iou_prediction_head = MLP(
+            transformer_dim,
+            iou_head_hidden_dim,
+            self.num_mask_tokens,
+            iou_head_depth,
+            sigmoid_output=iou_prediction_use_sigmoid,)
+    
 
         # self.gsefe = GSEFE(in_channels=3, out_channels=self.mask_feat_channels)
         # self.mdff = MDFF(out_channels=self.mask_feat_channels)   # adjust to MDFF's actual signature
@@ -79,16 +100,23 @@ class LBMSSAM2Integration(nn.Module):
         # `self.sam2.predict(prompts)` was binding the whole dict to the
         # `point_coords` parameter, leaving point_labels=None, which trips
         # the `assert point_labels is not None` inside _prep_prompts.
+
         sam_masks, scores, logits, mask_feats, mask_channels, output_tokens = (
             self.sam2.predict(**prompts)
         )
+
         print("Mask_Channels from SAM2.predict function: ", mask_channels)
         print("Mask Features from SAM2.predict function: ", mask_feats.shape)
         self.mask_channels = mask_channels
         return sam_masks, scores, logits, mask_feats , mask_channels, output_tokens
     
-
-
+    
+    def _get_stability_scores(self, mask_logits: torch.Tensor):
+        mask_logits = mask_logits.flatten(-2)
+        stability_delta = self.dynamic_multimask_stability_delta  # typically 1.0
+        area_i = torch.sum(mask_logits > stability_delta, dim=-1).float()
+        area_u = torch.sum(mask_logits > -stability_delta, dim=-1).float()
+        return torch.where(area_u > 0, area_i / area_u, 1.0)
 
     def forward(self, prompts):
         image_tensor = self.image_tensor
@@ -135,13 +163,47 @@ class LBMSSAM2Integration(nn.Module):
         # real 4-param signature), and kept argument order matching
         # FeatureFusion.forward(mask_feat, denoised_feat, edge_feat, output_token).
 
-        print('Output Tokens from LBMS_SAM_Integration file: ', output_tokens.shape)
+
+
+        '''
+        WHEN ENOUGH DATA (GROUND TRUTH) IS AVAILABLE, ADD A TRAINABLE IOU HEAD TO PREDICT THE QUALITY OF THE LBMS MASKS, 
+        SIMILAR TO SAM'S IOU HEAD. THIS WILL ALLOW US TO SELECT THE BEST MASK AMONG MULTIPLE OUTPUTS.
+        self.lbms_iou_head = nn.Sequential(
+            nn.Linear(token_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()          # output in [0, 1]
+            )
+
+        # In forward(), after fusion:
+        lbms_score = self.lbms_iou_head(output_tokens_fused).squeeze(-1)  # (B,)
+        '''
+        
         output_tokens_fused = output_tokens[:, 0, :]
         lbms_mask = self.fusion(mask_feats, mdff_output, gsefe_output, output_tokens_fused)
+        
+        
+        delta = 1.0
+        lbms_flat = lbms_mask.flatten(-2)          # (B, H*W)
+        area_i = (lbms_flat > delta).float().sum(-1)       # area at high threshold
+        area_u = (lbms_flat > -delta).float().sum(-1)      # area at low threshold
+        lbms_score = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
+        lbms_score_np = lbms_score.squeeze(0).detach().cpu().numpy()  # scalar
+
+
+        lbms_mask_upscaled = self.sam2._transforms.postprocess_masks(
+            lbms_mask.unsqueeze(1),   # (B,1,256,256) → matches what _predict() feeds it
+            self.sam2._orig_hw[-1],           # the original (H,W) stored when you called set_image()
+            )  # → (B, 1, H_orig, W_orig)
+        lbms_mask_np = (lbms_mask_upscaled.squeeze(1) > self.sam2.mask_threshold).squeeze(0).float().detach().cpu().numpy()
+        lbms_mask_np = lbms_mask.squeeze(0).float().detach().cpu().numpy()
  
-        return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask
+        return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask_np, lbms_score_np
 
 
+
+        
+        
 
 
 
