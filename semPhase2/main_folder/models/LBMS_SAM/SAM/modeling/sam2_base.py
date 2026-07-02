@@ -4,6 +4,9 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import sys
+sys.path.insert(0, "/Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/models/LBMS_SAM/SAM/modeling/")
+
 import torch
 import torch.distributed
 import torch.nn.functional as F

@@ -419,6 +419,15 @@ class SAM2ImagePredictor:
             for feat_level in self._features["high_res_feats"]
         ]
 
+        '''(masks=masks,
+            iou_pred=iou_pred,
+            sam_tokens_out=sam_tokens_out,
+            object_score_logits=object_score_logits,
+            mask_feat=mask_feat,
+            mask_channels=mask_channels,
+            output_tokens = output_tokens)
+                            '''
+
         decoder_out = self.model.sam_mask_decoder(
         image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
         image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
@@ -431,9 +440,11 @@ class SAM2ImagePredictor:
 
         low_res_masks = decoder_out.masks
         iou_predictions = decoder_out.iou_pred
+        sam_tokens_out = decoder_out.sam_tokens_out
+        object_score_logits = decoder_out.object_score_logits
         mask_feat = decoder_out.mask_feat
         mask_channels = decoder_out.mask_channels
-        output_tokens = decoder_out.all_mask_tokens
+        output_tokens = decoder_out.output_tokens
 
         # Upscale the masks to the original image resolution
         masks = self._transforms.postprocess_masks(

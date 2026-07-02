@@ -63,6 +63,12 @@ class LBMSSAM2Integration(nn.Module):
             torch.from_numpy(self.image).permute(2, 0, 1).unsqueeze(0).float()/ 255.0
             )
         self.sam2.set_image(image)
+
+        # cache trunk outputs here --
+        with torch.no_grad():
+            mdff_input = self.sam2._transforms(image)
+            mdff_input = mdff_input[None, ...].to(self.sam2.device)
+            self._trunk_features = self.image_encoder.trunk(mdff_input)
     
     def _get_features(self):
         return self.sam2._features
@@ -76,7 +82,8 @@ class LBMSSAM2Integration(nn.Module):
         sam_masks, scores, logits, mask_feats, mask_channels, output_tokens = (
             self.sam2.predict(**prompts)
         )
-        print(mask_channels)
+        print("Mask_Channels from SAM2.predict function: ", mask_channels)
+        print("Mask Features from SAM2.predict function: ", mask_feats.shape)
         self.mask_channels = mask_channels
         return sam_masks, scores, logits, mask_feats , mask_channels, output_tokens
     
@@ -113,7 +120,8 @@ class LBMSSAM2Integration(nn.Module):
         '''MDFF'''
         # FIX #2 continued: pull raw stage outputs from the trunk directly,
         # not the FpnNeck-projected backbone_fpn.
-        hierarchical_features = self.image_encoder.trunk(image_tensor)
+
+        hierarchical_features = self._trunk_features
         mdff_output = self.mdff(hierarchical_features)
         if mdff_output.shape[-2:] != target_hw:
             mdff_output = F.interpolate(
@@ -126,8 +134,10 @@ class LBMSSAM2Integration(nn.Module):
         # passed as a positional arg (arity mismatch against FeatureFusion's
         # real 4-param signature), and kept argument order matching
         # FeatureFusion.forward(mask_feat, denoised_feat, edge_feat, output_token).
-        
-        lbms_mask = self.fusion(mask_feats, mdff_output, gsefe_output, output_tokens)
+
+        print('Output Tokens from LBMS_SAM_Integration file: ', output_tokens.shape)
+        output_tokens_fused = output_tokens[:, 0, :]
+        lbms_mask = self.fusion(mask_feats, mdff_output, gsefe_output, output_tokens_fused)
  
         return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask
 
