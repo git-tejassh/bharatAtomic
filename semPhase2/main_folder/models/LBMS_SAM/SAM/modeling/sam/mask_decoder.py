@@ -20,7 +20,6 @@ class MaskDecoderOut:
     object_score_logits: torch.Tensor
     mask_feat: torch.Tensor
     mask_channels: int
-    output_tokens: torch.Tensor
 
 
 

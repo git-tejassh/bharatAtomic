@@ -102,7 +102,7 @@ class LBMSSAM2Integration(nn.Module):
         # the `assert point_labels is not None` inside _prep_prompts.
 
         sam_masks, scores, logits, mask_feats, mask_channels, output_tokens = (
-            self.sam2.predict(**prompts)
+            self.sam2.predict(**prompts,)
         )
 
         print("Mask_Channels from SAM2.predict function: ", mask_channels)
@@ -156,6 +156,11 @@ class LBMSSAM2Integration(nn.Module):
                 mdff_output, size=target_hw, mode="bilinear", align_corners=False
             )
 
+        multimask_output = prompts.get("multimask_output", True)
+        tok_range = range(1, self.num_mask_tokens) if multimask_output else range(0, 1)
+        delta = 1.0
+        lbms_masks_list = []
+        lbms_scores_list = []
 
         '''Feature Fusion'''
         # FIX #5: dropped the stray `mask_feats_channels` int that was being
@@ -179,24 +184,44 @@ class LBMSSAM2Integration(nn.Module):
         lbms_score = self.lbms_iou_head(output_tokens_fused).squeeze(-1)  # (B,)
         '''
         
-        output_tokens_fused = output_tokens[:, 0, :]
-        lbms_mask = self.fusion(mask_feats, mdff_output, gsefe_output, output_tokens_fused)
-        
-        
-        delta = 1.0
-        lbms_flat = lbms_mask.flatten(-2)          # (B, H*W)
-        area_i = (lbms_flat > delta).float().sum(-1)       # area at high threshold
-        area_u = (lbms_flat > -delta).float().sum(-1)      # area at low threshold
-        lbms_score = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
-        lbms_score_np = lbms_score.squeeze(0).detach().cpu().numpy()  # scalar
+        for tok_idx in tok_range:
+            token = output_tokens[:, tok_idx, :]          # (B, 256)
+            lbms_mask_i = self.fusion(
+                mask_feats, mdff_output, gsefe_output, token
+            )                                              # (B, H_latent, W_latent)
 
+            # Stability score per mask
+            flat = lbms_mask_i.flatten(-2)                # (B, H*W)
+            area_i = (flat > delta).float().sum(-1)
+            area_u = (flat > -delta).float().sum(-1)
+            score_i = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
+
+            lbms_masks_list.append(lbms_mask_i)
+            lbms_scores_list.append(score_i)
+        
+        lbms_masks_tensor = torch.stack(lbms_masks_list, dim=1)   # (B, N, H, W)
+        lbms_scores_tensor = torch.stack(lbms_scores_list, dim=1) # (B, N)
 
         lbms_mask_upscaled = self.sam2._transforms.postprocess_masks(
-            lbms_mask.unsqueeze(1),   # (B,1,256,256) → matches what _predict() feeds it
-            self.sam2._orig_hw[-1],           # the original (H,W) stored when you called set_image()
-            )  # → (B, 1, H_orig, W_orig)
-        lbms_mask_np = (lbms_mask_upscaled.squeeze(1) > self.sam2.mask_threshold).squeeze(0).float().detach().cpu().numpy()
-        lbms_mask_np = lbms_mask.squeeze(0).float().detach().cpu().numpy()
+            lbms_masks_tensor,
+            self.sam2._orig_hw[-1],
+        )  
+
+        
+
+
+        lbms_mask_np = (
+            (lbms_mask_upscaled > self.sam2.mask_threshold)
+            .squeeze(0)
+            .float()
+            .detach()
+            .cpu()
+            .numpy()
+            )  # (N, H_orig, W_orig) — same format as SAM's masks_np
+        
+        lbms_score_np = (
+            lbms_scores_tensor.squeeze(0).detach().cpu().numpy()
+            )  # (N,)
  
         return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask_np, lbms_score_np
 
