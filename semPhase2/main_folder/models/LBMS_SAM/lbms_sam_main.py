@@ -305,10 +305,12 @@ class LBMSCocoDataset(Dataset):
         }
     
 
+from typing import Optional
+
 def build_dataloader(
     coco_root_dir: str,
     target_size: int = 1024,
-    max_samples: int | None = None,
+    max_samples: Optional[int]= None,
     batch_size: int = 4,
     shuffle: bool = True,
     num_workers: int = 0,
@@ -371,7 +373,7 @@ def run_training(
     model,
     optimizer,
     loss_fn,
-    max_samples: int | None = 5,   # <-- the knob: small int for a smoke test, None for full dataset
+    max_samples: Optional[int] = 5,   # <-- the knob: small int for a smoke test, None for full dataset
     num_epochs: int = 1,
     batch_size: int = 1,
     target_size: int = 256,
