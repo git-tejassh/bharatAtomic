@@ -1,8 +1,8 @@
 # Bharat Atomic — AI-Driven SEM Image Enhancement Pipeline
 
-> **Tejas Shrivastava | ML Intern | Bharat Atomic Labs
+> **Tejas Shrivastava | ML Intern | Bharat Atomic Labs**
 >
-> *Real-time deep learning restoration of Scanning Electron Microscope (SEM) imagery — from synthetic noise engineering to production inference.*
+> *Real-time deep learning restoration and segmentation of Scanning Electron Microscope (SEM) imagery — from synthetic noise engineering through open-set instance segmentation to production inference.*
 
 ---
 
@@ -31,10 +31,18 @@
     - [5.5 Training Infrastructure](#55-training-infrastructure)
     - [5.6 Results \& Benchmarks](#56-results--benchmarks)
     - [5.7 Key Design Decisions](#57-key-design-decisions)
-  - [6. Phase 2 — Segmentation, Deblurring \& Super-Resolution *(Planned)*](#6-phase-2--segmentation-deblurring--super-resolution-planned)
+  - [6. Phase 2 — Open-Set Instance Segmentation \& Microstructure Analysis *(Active)*](#6-phase-2--open-set-instance-segmentation--microstructure-analysis-active)
+    - [6.1 The Open-Set Constraint](#61-the-open-set-constraint)
+    - [6.2 Binary Segmentation Strategy](#62-binary-segmentation-strategy)
+    - [6.3 Primary Track — LBMS-SAM](#63-primary-track--lbms-sam)
+    - [6.4 Secondary \& Baseline Tracks](#64-secondary--baseline-tracks)
+    - [6.5 Material Conditioning](#65-material-conditioning)
+    - [6.6 Latency Budget](#66-latency-budget)
+    - [6.7 Phase 2.1 — Morphometric Analysis *(Downstream, Planned)*](#67-phase-21--morphometric-analysis-downstream-planned)
   - [7. Phase 3 — RL-Based Autonomous SEM Calibration *(Planned)*](#7-phase-3--rl-based-autonomous-sem-calibration-planned)
   - [8. Codebase Reference](#8-codebase-reference)
     - [`semPhase1/notebooks/base.py`](#semphase1notebooksbasepy)
+    - [`semPhase2/notebooks/` — Segmentation Modules](#semphase2notebooks--segmentation-modules)
   - [9. Installation \& Setup](#9-installation--setup)
     - [Requirements](#requirements)
     - [Pre-trained Weights](#pre-trained-weights)
@@ -48,7 +56,8 @@
   - [13. Lessons Learned](#13-lessons-learned)
   - [14. Remaining Work \& Roadmap](#14-remaining-work--roadmap)
     - [Phase 1 Remaining](#phase-1-remaining)
-    - [Phase 2 *(Planned)*](#phase-2-planned)
+    - [Phase 2A *(Current — Binary Open-Set Segmentation)*](#phase-2a-current--binary-open-set-segmentation)
+    - [Phase 2B *(Planned — after hardware)*](#phase-2b-planned--after-hardware)
     - [Phase 3 *(Planned)*](#phase-3-planned)
   - [15. References](#15-references)
 
@@ -58,7 +67,7 @@
 
 **Bharat Atomic Labs** is a deep-tech hardware startup building production-grade **Field-Emission Scanning Electron Microscopes (FE-SEMs)** in India. An SEM is a scientific instrument that scans a focused electron beam across a sample surface, collecting secondary electrons, backscattered electrons, and X-rays to produce nanometer-resolution images of material surfaces and microstructures.
 
-The commercial impact of SEM spans semiconductor inspection, materials science, pharmaceutical QC, academic research, and industrial failure analysis. However, the entire software stack — image processing, analysis, calibration — is currently proprietary and locked to Western vendors. **Bharat Atomic's vision is to build this stack entirely in-house, with AI-driven automation as a core differentiator.** This internship project is part of that vision.
+The commercial impact of SEM spans semiconductor inspection, materials science, pharmaceutical QC, academic research, and industrial failure analysis. However, the entire software stack — image processing, analysis, calibration — is currently proprietary and locked to Western vendors (Zeiss, Thermo Fisher, JEOL, Hitachi). **Bharat Atomic's vision is to build this stack entirely in-house, with AI-driven automation as a core differentiator**, at a price point that undercuts imported instruments. This internship project is part of that vision.
 
 ---
 
@@ -75,7 +84,7 @@ The fast scan is the practical default for users who want live previews or quick
 2. **Slow scans can introduce their own artifacts.** High cumulative dose on non-conductive samples causes **electrostatic charging**, which produces bright streaks, image distortion, and physically repels subsequent electrons.
 3. **Downstream tasks require clean images.** Particle sizing, defect detection, crystal structure classification, and segmentation model training all fail or degrade on noisy inputs.
 
-The objective of Phase 1 is to **take a fast-scan (noisy) SEM image and restore it to the quality of a slow, careful scan** — perceptually clean, with fine surface features intact — using deep learning.
+The objective of Phase 1 was to **take a fast-scan (noisy) SEM image and restore it to the quality of a slow, careful scan** — perceptually clean, with fine surface features intact — using deep learning. Phase 2 builds directly on that restored output: it segments individual particles, grains, and features in the denoised image so their morphology can be measured.
 
 ---
 
@@ -85,8 +94,8 @@ This project is structured across three phases of increasing complexity:
 
 | Phase | Scope | Status |
 |---|---|---|
-| **Phase 1** | SEM Image Denoising & Restoration | ✅ In progress (experiments complete, GPU training pending) |
-| **Phase 2** | Defect Segmentation, Deblurring, Super-Resolution | 🔜 Planned |
+| **Phase 1** | SEM Image Denoising & Restoration | ✅ Complete (architecture, training, and benchmarking finished on MPS hardware; GPU-scale retraining and real-hardware validation pending) |
+| **Phase 2** | Open-Set Instance Segmentation & Microstructure Analysis | 🟡 Active (Phase 2A — binary segmentation architecture and annotation pipeline in progress) |
 | **Phase 3** | RL-Based Autonomous SEM Parameter Calibration | 🔜 Planned |
 
 ---
@@ -96,38 +105,62 @@ This project is structured across three phases of increasing complexity:
 ```
 bharatAtomic/
 │
-├── README.md                        ← This file (parent-level project overview)
+├── README.md                            ← This file (parent-level project overview)
 │
-├── semPhase1/                       ← Phase 1: Denoising pipeline
-│   ├── README.md                    ← Phase 1 detailed notebook/code README
+├── semPhase1/                           ← Phase 1: Denoising pipeline (complete)
+│   ├── README.md                        ← Phase 1 detailed notebook/code README
 │   ├── dataset/
-│   │   └── crop/images/             ← NFFA-Europe SEM dataset (256×256 crops)
+│   │   └── crop/images/                 ← NFFA-Europe SEM dataset (256×256 crops)
 │   └── notebooks/
-│       ├── base.py                  ← Shared pipeline: data, noise, training, eval
-│       ├── models/                  ← Architecture definitions
-│       │   ├── rdunet.py            ← RDUNet (Dense Residual U-Net)
-│       │   ├── NAFNet_arch.py       ← NAFNet (Nonlinear Activation Free Network)
-│       │   ├── AttentionNet.py      ← Custom Attention U-Net
-│       │   └── dncnn.py             ← DnCNN (Denoising CNN baseline)
-│       ├── rdunet.ipynb             ← RDUNet training & evaluation notebook
-│       ├── nafnet.ipynb             ← NAFNet fine-tuning notebook
-│       ├── dncnn.ipynb              ← DnCNN from-scratch training notebook
-│       ├── attentionNet.ipynb       ← Attention U-Net training notebook
-│       └── images/                  ← Test images for inference demos
+│       ├── base.py                      ← Shared pipeline: data, noise, training, eval
+│       ├── models/                      ← Architecture definitions
+│       │   ├── rdunet.py                ← RDUNet (Dense Residual U-Net)
+│       │   ├── NAFNet_arch.py           ← NAFNet (Nonlinear Activation Free Network)
+│       │   ├── AttentionNet.py          ← Custom Attention U-Net
+│       │   └── dncnn.py                 ← DnCNN (Denoising CNN baseline)
+│       ├── rdunet.ipynb                 ← RDUNet training & evaluation notebook
+│       ├── nafnet.ipynb                 ← NAFNet fine-tuning notebook
+│       ├── dncnn.ipynb                  ← DnCNN from-scratch training notebook
+│       ├── attentionNet.ipynb           ← Attention U-Net training notebook
+│       └── images/                      ← Test images for inference demos
 │
-├── semPhase2/                       ← Phase 2 (planned)
-└── semPhase3/                       ← Phase 3 (planned)
+├── semPhase2/                           ← Phase 2: Segmentation pipeline (active)
+│   ├── README.md                        ← Phase 2 detailed architecture/dataset README
+│   ├── dataset/
+│   │   ├── raw/                         ← NFFA-Europe source images (from Phase 1)
+│   │   ├── annotated/                   ← Binary mask annotations (COCO JSON format)
+│   │   └── augmented/                   ← Noise-augmented image-mask pairs
+│   └── notebooks/
+│       ├── base_seg.py                  ← Shared pipeline: data loading, metrics, eval
+│       ├── models/
+│       │   ├── lbms_sam/
+│       │   │   ├── gsefe.py             ← Gabor-Sobel Edge Feature Extractor
+│       │   │   ├── mdff.py              ← Multi-scale Denoised Feature Fusion
+│       │   │   └── lbms_sam.py          ← Full LBMS-SAM wrapper over frozen SAM2.1
+│       │   ├── attention_unet_film.py   ← Attention U-Net + FiLM conditioning (baseline)
+│       │   ├── embedding_table.py       ← 10-class learned embedding + FiLM MLP
+│       │   └── auto_classifier.py       ← DINOv2 linear probe (material-detection safety net)
+│       ├── annotation/
+│       │   ├── bootstrap_sam.py         ← Zero-shot SAM on raw images to seed annotation
+│       │   └── augment_masks.py         ← Apply Phase 1 noise engine to annotated pairs
+│       ├── lbms_sam.ipynb               ← LBMS-SAM training and evaluation
+│       ├── rfdetr.ipynb                 ← RF-DETR single-class training and evaluation
+│       ├── yolo_seg.ipynb               ← YOLOv11-seg single-class training and evaluation
+│       └── attention_unet_film.ipynb    ← Attention U-Net + FiLM baseline
+│
+└── semPhase3/                           ← Phase 3: RL calibration (planned)
+    └── README.md
 ```
 
 ---
 
 ## 5. Phase 1 — SEM Image Denoising
 
-Phase 1 establishes the complete supervised denoising pipeline: real SEM dataset → synthetic noise generation → model training → evaluation. Four architectures were implemented, trained, and benchmarked.
+Phase 1 establishes the complete supervised denoising pipeline: real SEM dataset → synthetic noise generation → model training → evaluation. Four architectures were implemented, trained, and benchmarked. Its output — a denoised, fast-scan-quality-restored image — is the input Phase 2's segmentation models are designed to consume.
 
 ### 5.1 Dataset
 
-**Source:** [NFFA-Europe Majority SEM Dataset](https://b2nd.eudat.eu/dataset/31296749-82da-5e45-8cf1-1e710a12f4ac) — an open scientific dataset from the European Nanoscience Foundries and Fine Analysis (NFFA) infrastructure project, containing SEM micrographs from multiple institutions across a wide variety of materials: particles, biological samples, fibres, porous materials, MEMS structures, and more.
+**Source:** [NFFA-Europe Majority SEM Dataset](https://b2nd.eudat.eu/dataset/31296749-82da-5e45-8cf1-1e710a12f4ac) — an open scientific dataset from the European Nanoscience Foundries and Fine Analysis (NFFA) infrastructure project, containing SEM micrographs from multiple institutions across ten material categories: Tips, Particles, Patterned Surfaces, MEMS Devices, Nanowires, Porous Sponge, Biological, Powder, Films/Coated Surfaces, and Fibres.
 
 **Why real SEM images and not ImageNet?** General-purpose natural image datasets have fundamentally different statistical properties from electron micrographs — different spatial frequency distributions, no colour, different texture classes. Training on ImageNet would require additional domain adaptation. Starting from actual SEM data ensures the model learns texture, edge, and structure representations grounded in electron microscopy from the very first gradient step.
 
@@ -146,11 +179,13 @@ Phase 1 establishes the complete supervised denoising pipeline: real SEM dataset
 - **Split:** 70% training / 30% test, with a further 20% of training held out for validation → effective split: ~56% train / 14% val / 30% test
 - Each clean image augmented with **4–5 randomly generated noisy versions** → total dataset of approximately **65,000 image pairs**
 
+> **Note for Phase 2:** NFFA-Europe is classification-only — it has no pixel-level masks. It is used in Phase 2 only as an unlabeled annotation pool and for evaluating material-class conditioning, not as a source of ground-truth segmentation masks.
+
 ---
 
 ### 5.2 SEM Noise Synthesis Pipeline
 
-This is the most technically novel and critical component of Phase 1. Standard Gaussian noise is insufficient — real SEM images suffer from a combination of physical effects arising from the electron beam, detector electronics, and scanning mechanism. A model trained only on Gaussian noise would fail in deployment on real instruments.
+This is the most technically novel and critical component of Phase 1, and it is reused directly in Phase 2 as a free augmentation engine for annotated segmentation pairs. Standard Gaussian noise is insufficient — real SEM images suffer from a combination of physical effects arising from the electron beam, detector electronics, and scanning mechanism. A model trained only on Gaussian noise would fail in deployment on real instruments.
 
 The `NoiseImage` class in `base.py` implements **six distinct noise functions**, each modelling a real physical source:
 
@@ -213,7 +248,7 @@ A critical design decision was moving from **single-noise-type augmentation** to
 
 The `new_augment_sem` function applies each noise type **independently with its own probability**, magnitudes drawn from ranges rather than fixed values. No two augmented versions of the same image look exactly alike. This significantly improved test-set generalisation and eliminated composite-noise artifacts entirely.
 
-> **Note:** Geometric augmentations (flips, rotations, affine transforms) were intentionally deferred. For denoising, geometric augmentations must be applied **identically** to both the noisy input and clean target (paired augmentation). Applying them independently gives the network contradictory supervision signals. Paired geometric augmentation is planned as a targeted lever once current models reach a performance plateau.
+> **Note:** Geometric augmentations (flips, rotations, affine transforms) were intentionally deferred in Phase 1. For denoising, geometric augmentations must be applied **identically** to both the noisy input and clean target (paired augmentation). In Phase 2, this constraint is even stricter — geometric transforms must be applied identically across the image, the noise, and the segmentation mask.
 
 ---
 
@@ -234,7 +269,7 @@ DnCNN (Zhang et al., 2017) reframes denoising as **residual learning** — inste
 
 #### Attention U-Net
 
-Custom implementation with a 3-level encoder (64→128→256 channels), 512-channel bottleneck, and 3-level decoder. Each decoder block applies an **attention gate** to its skip connection — a soft spatial mask learned from the decoder feature map that decides which encoder regions are relevant. In practice, this focuses computation on textured regions that need denoising while suppressing smooth, featureless areas. Trained from scratch.
+Custom implementation with a 3-level encoder (64→128→256 channels), 512-channel bottleneck, and 3-level decoder. Each decoder block applies an **attention gate** to its skip connection — a soft spatial mask learned from the decoder feature map that decides which encoder regions are relevant. In practice, this focuses computation on textured regions that need denoising while suppressing smooth, featureless areas. Trained from scratch. (The same attention-gated architecture is reused in Phase 2 as a FiLM-conditioned segmentation baseline — see Section 6.4.)
 
 #### RDUNet (Fine-Tuned)
 
@@ -248,7 +283,7 @@ Pre-trained weights (`model_gray.pth`) were loaded from the original authors' pu
 
 NAFNet (Chen et al., 2022) eliminates expensive non-linear operations — replacing standard channel attention with a **SimpleGate** (splits channels, multiplies two halves) and removing ReLU/GELU entirely. Despite apparent simplicity, this achieves state-of-the-art performance on the SIDD denoising benchmark and is notably faster than prior architectures.
 
-Pre-trained checkpoint: `NAFNet-SIDD-width32.pth` (trained on smartphone camera noise). **Frozen:** full encoder + first half of middle blocks. **Trainable:** `middle_blks[6–11]`, `decoders[1–3]`, `ups[1–3]`. The encoder captures general texture/noise priors transferable across domains; the decoder needs domain adaptation for SEM-specific reconstruction.
+Pre-trained checkpoint: `NAFNet-SIDD-width32.pth` (trained on smartphone camera noise). **Frozen:** full encoder + first half of middle blocks. **Trainable:** `middle_blks[6–11]`, `decoders[1–3]`, `ups[1–3]`. The encoder captures general texture/noise priors transferable across domains; the decoder needs domain adaptation for SEM-specific reconstruction. NAFNet is the current pick for the real-time preview track feeding into Phase 2's live segmentation loop (Section 6.6).
 
 ---
 
@@ -274,7 +309,7 @@ Loss = (1 − θ) × L1(pred, target) + θ × DISTS(pred, target)
 
 The key insight: SSIM and PSNR measure fidelity at specific pixel locations; **DISTS measures structural and textural pattern similarity in a shift-invariant, multi-scale way** using a pre-trained VGG feature extractor. For SEM images, surface texture is often the most scientifically important feature. This switch produced **visibly sharper grain boundaries and clearer surface features**, even when the PSNR improvement was marginal (<0.5 dB).
 
-> Note: Unlike `(1 − SSIM)`, the DISTS score is a raw distance (lower = more similar) and enters the loss directly, not subtracted from 1.
+> Note: this "Phase 2" label refers to the second loss-design iteration *within Phase 1 denoising*, not the segmentation Phase 2 described in Section 6. Unlike `(1 − SSIM)`, the DISTS score is a raw distance (lower = more similar) and enters the loss directly, not subtracted from 1.
 
 Experiments were run with θ = 0.4 and θ = 0.75. Higher θ biases the loss toward perceptual quality, potentially at the cost of pixel-level accuracy.
 
@@ -294,7 +329,7 @@ All models trained with **Adam** (lr = 1e-4, default betas). A **ReduceLROnPlate
 - No TensorRT — NVIDIA's inference optimisation runtime is CUDA-only
 - Long epoch times: 90 minutes to 8–9 hours depending on architecture and dataset size
 
-**Mixed Precision:** `torch.bfloat16` via `torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)` — halves activation memory footprint while retaining float32 for loss and backward pass. Provides ~15–20% speedup on MPS.
+**Mixed Precision:** `torch.bfloat16` via `torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)` — halves activation memory footprint while retaining float32 for loss and backward pass. Provides ~15–20% speedup on MPS. (Note: `bfloat16`, not `float16`, is used throughout on MPS — the same convention carries over to Phase 2 training.)
 
 **Checkpointing:** Saves every `save_freq` epochs (typically 1–2) to avoid losing multi-hour runs to thermal throttling or interruptions. Running best-model checkpoint maintained on validation loss.
 
@@ -326,7 +361,7 @@ All results are from the best training run for each architecture on the 30% hold
 - **Fine-tuned models** (NAFNet, RDUNet) significantly outperformed from-scratch models on SEM-specific structured artifacts (scanline banding, charging gradients). From-scratch models were better at isotropic shot noise but struggled with directional, correlated artifacts — validating the decision to transfer pretrained priors
 - **DISTS composite loss** produced visibly sharper texture preservation compared to SSIM composite, even at similar PSNR — grain boundaries and surface features were noticeably cleaner
 
-**Inference target:** The real-time deployment goal is <40–60 ms per frame at **1K resolution** at 16–24 fps. NAFNet at 256×256 achieves ~70 ms on MPS. At 1K (16× more pixels), direct scaling is not linear due to parallelism, but sub-40 ms is unlikely on MPS without CUDA+TensorRT. On an RTX 4090 with TensorRT, NAFNet at 1K could realistically achieve **15–25 ms**, meeting the real-time target.
+**Inference target:** The real-time deployment goal is <40–60 ms per frame at **1K resolution** at 16–24 fps, and the denoiser must fit inside a shared budget with Phase 2's segmentation model (see Section 6.6). NAFNet at 256×256 achieves ~70 ms on MPS. At 1K (16× more pixels), direct scaling is not linear due to parallelism, but sub-40 ms is unlikely on MPS without CUDA+TensorRT. On an RTX 4090 with TensorRT, NAFNet at 1K could realistically achieve **15–25 ms**, meeting the real-time target and leaving the remainder of the 40 ms budget for segmentation.
 
 > **Important caveat:** All metrics are measured on synthetically noised images where the ground truth is exactly known. This tends to inflate numbers compared to deployment on real fast-scan hardware images. True performance on live SEM hardware remains to be validated — this is a key remaining Phase 1 deliverable.
 
@@ -347,18 +382,63 @@ All results are from the best training run for each architecture on the 30% hold
 
 ---
 
-## 6. Phase 2 — Segmentation, Deblurring & Super-Resolution *(Planned)*
+## 6. Phase 2 — Open-Set Instance Segmentation & Microstructure Analysis *(Active)*
 
-Phase 2 begins after Phase 1 sign-off and builds directly on the restored images produced by the Phase 1 denoiser.
+Phase 2 takes the denoised output of Phase 1 and segments individual particles, grains, defects, and other microstructural features so their morphology can be quantified. Full details, dataset strategy, architecture comparisons, and checklists live in `semPhase2/README.md`; this section summarises the current state.
 
-**Defect Detection & Feature Segmentation:**
-Training a segmentation model (likely **YOLOv8-seg** combined with **SAM2** for instance segmentation) to identify and localise surface features, defects, grain boundaries, and particles in restored SEM images. Phase 1 denoising is a prerequisite — segmentation models fail or degrade on noisy inputs.
+### 6.1 The Open-Set Constraint
 
-**Deblurring & Resolution Enhancement:**
-SEM images acquired at high magnification or with beam focus issues can appear blurry rather than noisy. Deblurring handles deterministic blur; **super-resolution** aims to recover sub-pixel detail from lower-magnification images. These are related but distinct from denoising and require dedicated model variants.
+Bharat Atomic's SEM is a general-purpose instrument — customers will place arbitrary, unknown sample materials under the beam. This rules out closed-set detectors (trained on a fixed list of object classes) as the primary segmentation approach, because the model must be able to segment *any* material a user inserts, not just materials seen during training. The NFFA-Europe taxonomy of 10 material classes (Tips, Particles, Patterned Surfaces, MEMS Devices, Nanowires, Porous Sponge, Biological, Powder, Films/Coated Surfaces, Fibres) is used as an initial conditioning taxonomy rather than a closed label set.
 
-**Multimodal Input:**
-The system will eventually handle SE, BSE, and EDS (X-Ray) images together, as each carries complementary information about the sample. Phase 2 will begin exploring multi-channel input architectures.
+### 6.2 Binary Segmentation Strategy
+
+Rather than attempting multi-class semantic segmentation from day one — which would require per-class pixel-level annotation across an open-ended material space — Phase 2A targets **binary instance segmentation**: separating "sample feature" from "background," regardless of material identity. This is the decision that makes annotation tractable: one shared set of binary masks trains every architecture candidate in parallel, and multi-class semantic segmentation is deferred to Phase 2B once Bharat Atomic has its own SEM hardware to collect material-labeled data at scale.
+
+### 6.3 Primary Track — LBMS-SAM
+
+The primary architecture is **LBMS-SAM**, adapted from a 2026 *Neural Networks* paper (Qi et al.) originally designed for lithium battery material SEM segmentation. It keeps a **frozen SAM2.1 Hiera Base Plus backbone** (~312M parameters) entirely untouched and adds two small trainable adapter modules on top of it:
+
+- **GSEFE (Gabor-Sobel Edge Feature Extractor):** applies fixed Sobel and Gabor filters directly to the raw input image to recover boundary and texture cues that SAM's natural-image-trained encoder underweights — critical for SEM images where touching particles and grains lack the clear spatial gaps SAM expects between objects.
+- **MDFF (Multi-scale Denoised Feature Fusion):** takes SAM's intermediate Hiera stage-end pyramid features (112→224→448→896 channels), applies a Haar wavelet decomposition with learnable soft-thresholding to suppress residual high-frequency noise, and fuses the result back into the feature stream.
+- **FeatureFusion:** combines the SAM mask-decoder branch and the LBMS (GSEFE+MDFF) branch through a fuse-then-dot pipeline using SAM's own hypernetwork-conditioned output token, producing the final refined mask.
+
+Total trainable parameter count is approximately **1.3M**, against ~312M frozen. This is the correct trade-off given the open-set constraint: full SAM fine-tuning was tested in ablation and produced catastrophic forgetting (IoU dropped from 95.6 to 80.5, Boundary IoU from 86.5 to 52.6), confirming that the general-purpose segmentation prior must be preserved and only the adapters trained.
+
+### 6.4 Secondary & Baseline Tracks
+
+Because binary segmentation lets every candidate train on the same annotation set, several architectures are being evaluated in parallel rather than committing early to one:
+
+| Track | Role | Trade-off |
+|---|---|---|
+| **LBMS-SAM** | Primary — high-precision measurement frames | Best expected mask quality; heavier compute, needs careful adapter-only training |
+| **RF-DETR-Seg** | Real-time preview candidate | Faster; single-class fine-tune, less boundary precision than LBMS-SAM |
+| **YOLOv11-seg** | Real-time preview candidate | Fast, well-supported tooling; weaker on touching/overlapping instances |
+| **Attention U-Net + FiLM** | Baseline | Reuses the Phase 1 architecture; establishes a from-scratch lower bound |
+| **MobileSAM / FastSAM** | Lightweight open-set alternative | Cheaper than full SAM; quality/latency still to be benchmarked |
+| **SAM-I-Am-style post-processing** | Zero-training booster | Rule-based cleanup on zero-shot SAM output; used as a baseline before any adapter training |
+
+This two-track deployment model — LBMS-SAM for high-precision measurement, a lighter model (YOLO11-seg or RF-DETR-Seg with frozen DINOv2) for live 24fps preview — is the current plan for balancing accuracy against the hard real-time constraint.
+
+### 6.5 Material Conditioning
+
+Rather than one-hot encoding the 10 NFFA-Europe material classes (which would require architectural surgery every time a new material type is added), Phase 2 uses a **learned embedding table** (64-dim per class) that feeds a FiLM (Feature-wise Linear Modulation) conditioning layer in the segmentation decoder. A DINOv2 linear-probe auto-classifier proposes the likely material class at scan time as a safety net, which the user can confirm or override — it exists to catch cases where an operator forgets to update the material selector between samples, not to replace user judgement.
+
+### 6.6 Latency Budget
+
+Phase 2 segmentation operates under a **hard <40ms end-to-end latency ceiling**, shared with the Phase 1 denoiser in the same real-time pipeline:
+
+```
+Preprocessing (resize, normalize, channel conversion)         ~1–3 ms
+Denoiser forward pass (Phase 1 NAFNet, RTX 4090 + TensorRT)   ~15–25 ms (projected, 1K)
+Segmentation forward pass                                      ~15–20 ms remaining budget
+Mask postprocessing (upsampling, merge/NMS logic)              ~2–5 ms
+```
+
+Real-time candidates (YOLOv11-seg, RF-DETR-Seg, MobileSAM/FastSAM) are expected to fit this budget on CUDA hardware; LBMS-SAM's larger backbone is likely to exceed it at 1K resolution and is positioned instead for high-precision, non-real-time measurement frames rather than the live preview stream.
+
+### 6.7 Phase 2.1 — Morphometric Analysis *(Downstream, Planned)*
+
+Once segmentation masks are stable, a downstream (and deliberately decoupled, non-real-time) pipeline will compute physical measurements per instance: particle size distribution, aspect ratio, circularity, porosity, and defect detection, calibrated to physical units using the SEM's own scale-bar metadata. This runs asynchronously from the real-time segmentation loop rather than inside the 40ms budget.
 
 ---
 
@@ -367,11 +447,11 @@ The system will eventually handle SE, BSE, and EDS (X-Ray) images together, as e
 Phase 3 is the most technically ambitious component: a **closed-loop reinforcement learning agent** that observes the current image quality and automatically adjusts SEM operating parameters — beam current, accelerating voltage, focus, stigmation, working distance — to maximise image quality without human operator input.
 
 **RL Formulation:**
-- **State:** Current (noisy/blurry) SEM image + quality metrics (PSNR, SSIM, DISTS)
+- **State:** Current (noisy/blurry) SEM image + quality metrics (PSNR, SSIM, DISTS) + Phase 2 segmentation output
 - **Action space:** Adjustable SEM parameters (beam current, accelerating voltage, focus, stigmation, working distance)
-- **Reward:** Improvement in image quality after parameter change
+- **Reward:** Improvement in image quality / segmentation confidence after parameter change
 
-The agent must learn not just which parameters to change, but how much and in what sequence — parameter interactions in SEMs are non-trivial and can be non-monotonic.
+The agent must learn not just which parameters to change, but how much and in what sequence — parameter interactions in SEMs are non-trivial and can be non-monotonic. Given the cost and risk of online exploration on physical hardware, offline RL or imitation learning from logged operator adjustments, plus a simulation environment, are expected to precede any live closed-loop training — RL is treated as phase-3 research, not a default first approach.
 
 ---
 
@@ -379,7 +459,7 @@ The agent must learn not just which parameters to change, but how much and in wh
 
 ### `semPhase1/notebooks/base.py`
 
-The central shared module. All model notebooks import from this file.
+The central shared module for Phase 1. All denoising model notebooks import from this file.
 
 | Component | Description |
 |---|---|
@@ -407,6 +487,22 @@ The central shared module. All model notebooks import from this file.
 > test_func(model, image_path, transform=transform_1, channels=1, device=device)
 > ```
 
+### `semPhase2/notebooks/` — Segmentation Modules
+
+| Component | Description |
+|---|---|
+| `base_seg.py` | Shared Phase 2 pipeline: data loading, metrics, evaluation |
+| `models/lbms_sam/gsefe.py` | Gabor-Sobel Edge Feature Extractor — fixed filters + small trainable enhancement CNN |
+| `models/lbms_sam/mdff.py` | Multi-scale Denoised Feature Fusion — per-level 1×1 projection, Haar DWT, learnable soft-thresholding, fusion conv |
+| `models/lbms_sam/lbms_sam.py` | Full LBMS-SAM wrapper: loads frozen SAM2.1, attaches GSEFE/MDFF/FeatureFusion adapters |
+| `models/attention_unet_film.py` | Attention U-Net baseline with FiLM conditioning from the material embedding table |
+| `models/embedding_table.py` | 10-class learned embedding (64-dim) + FiLM MLP, extensible by adding rows |
+| `models/auto_classifier.py` | DINOv2 linear probe for material-class auto-detection |
+| `annotation/bootstrap_sam.py` | Runs zero-shot SAM on raw images to seed human-corrected annotation |
+| `annotation/augment_masks.py` | Applies Phase 1's `NoiseImage`/`new_augment_sem` to annotated image-mask pairs |
+
+> **Important architectural note:** SAM2's `backbone_fpn` output is **not** the correct tensor to feed MDFF — it is post-FpnNeck and uniformly projected to 256 channels, which destroys the varying per-stage channel information (112→224→448→896) that MDFF's per-branch projection is designed around. The correct access path is `image_encoder.trunk()` for raw Hiera stage-end features.
+
 ---
 
 ## 9. Installation & Setup
@@ -419,14 +515,19 @@ torch torchvision torchaudio          # PyTorch (MPS or CUDA)
 albumentations                        # Image augmentation
 numpy pillow tifffile matplotlib
 
-# Metrics
+# Phase 1 — Metrics
 pytorch-msssim                        # SSIM loss
 torchmetrics                          # PSNR metric
 DISTS-pytorch                         # DISTS perceptual metric
 
-# Architectures
+# Phase 1 — Architectures
 # NAFNet: NAFNet_arch.py, local_arch.py, arch_util.py (included in models/)
 # RDUNet: models/rdunet.py (included)
+
+# Phase 2 — Segmentation
+# SAM2.1 (Hiera Base Plus) — vendored under semPhase2/notebooks/models/lbms_sam/SAM/
+# ultralytics                         # YOLOv11-seg
+# rfdetr                              # RF-DETR
 ```
 
 ```bash
@@ -440,8 +541,9 @@ pip install torch torchvision albumentations pillow tifffile matplotlib \
 |---|---|---|
 | NAFNet | `NAFNet-SIDD-width32.pth` | [Original NAFNet repo](https://github.com/megvii-research/NAFNet) |
 | RDUNet | `model_gray.pth` | [Gurrola-Ramos et al. GitHub](https://github.com/jgurramCR/RDUNet) |
+| SAM2.1 Hiera-B+ | `sam2.1_hiera_base_plus.pt` | [Meta SAM2 repo](https://github.com/facebookresearch/sam2) |
 
-Place checkpoints in `semPhase1/notebooks/models/checkpoints/` and update paths in each notebook before loading.
+Place checkpoints in each phase's `models/checkpoints/` directory and update paths in the relevant notebook before loading.
 
 ---
 
@@ -473,6 +575,8 @@ fineTune(
     device=device
 )
 ```
+
+Phase 2 training (LBMS-SAM adapters, RF-DETR, YOLOv11-seg, Attention U-Net + FiLM) follows the same notebook-per-model convention under `semPhase2/notebooks/`; see `semPhase2/README.md` for the current annotation and training checklist.
 
 ### Single-Image Inference
 
@@ -512,7 +616,7 @@ followed by a side-by-side visualisation of input (degraded), prediction, and la
 
 ## 11. Metrics & Evaluation Philosophy
 
-Three complementary metrics are tracked across all experiments:
+Three complementary metrics are tracked across all Phase 1 experiments:
 
 | Metric | What It Measures | Why It's Used |
 |---|---|---|
@@ -523,6 +627,8 @@ Three complementary metrics are tracked across all experiments:
 PSNR and SSIM measure fidelity at specific pixel locations. DISTS is shift-invariant and captures whether the restored image has the same kinds of textures and structures as the clean target, even if they are not pixel-perfectly aligned. For SEM images, where **surface texture is the primary scientific observable**, DISTS is the most meaningful metric for deployment quality.
 
 Improvements of less than 0.5 dB PSNR are perceptually invisible, but visual inspection revealed that models with marginally lower PSNR sometimes produced clearly better-looking grain boundaries. DISTS partially closes this gap. **Visual QA with domain experts remains essential** alongside quantitative metrics.
+
+Phase 2 evaluation uses a different metric set appropriate for segmentation — IoU, Dice, Boundary IoU, IoU-head calibration MAE, and per-material-class breakdowns across the 10 NFFA categories — tracked separately in `semPhase2/README.md`. A single IoU number is treated as necessary but not sufficient; boundary quality and per-class robustness matter more for touching/overlapping instances than aggregate IoU alone.
 
 ---
 
@@ -537,6 +643,8 @@ Improvements of less than 0.5 dB PSNR are perceptually invisible, but visual ins
 | No TensorRT | Real-time inference optimisation unavailable |
 | Epoch time: 90 min – 9 hours | Very limited hyperparameter exploration; ~2–3 epochs per day |
 
+This same MPS constraint applies to Phase 2's adapter-only LBMS-SAM training, though the frozen-backbone design keeps the trainable parameter count (~1.3M) small enough that adapter training is feasible on MPS even without a GPU upgrade; full SAM2 fine-tuning would not be.
+
 ### GPU Target: NVIDIA (Incoming)
 
 Once a dedicated CUDA-capable GPU is available:
@@ -545,7 +653,8 @@ Once a dedicated CUDA-capable GPU is available:
 - Batch sizes can scale to 16–32+
 - Resolution can scale to 512×512 and 1024×1024
 - TensorRT optimisation becomes available for production inference
-- **Projected NAFNet inference on RTX 4090 + TensorRT at 1K resolution: 15–25 ms** — meeting the real-time target of <40 ms
+- **Projected NAFNet inference on RTX 4090 + TensorRT at 1K resolution: 15–25 ms** — meeting the real-time target of <40 ms and leaving headroom for Phase 2 segmentation in the same budget
+- Required for benchmarking Phase 2's real-time candidates (YOLOv11-seg, RF-DETR-Seg, MobileSAM/FastSAM) against the <40ms ceiling under realistic conditions
 
 ---
 
@@ -553,13 +662,17 @@ Once a dedicated CUDA-capable GPU is available:
 
 **Domain understanding precedes model selection.** The highest-impact work in Phase 1 was not architecture engineering — it was understanding SEM noise physics well enough to build a realistic noise simulator. A state-of-the-art architecture trained on the wrong noise distribution would fail in deployment. The `NoiseImage` class is the intellectual core of Phase 1.
 
-**Metrics and perception diverge.** PSNR improvements below 0.5 dB are perceptually invisible. DISTS partially closes the gap between objective scores and visual quality, but no metric fully replaces domain expert visual QA.
+**Metrics and perception diverge.** PSNR improvements below 0.5 dB are perceptually invisible. DISTS partially closes the gap between objective scores and visual quality, but no metric fully replaces domain expert visual QA — the same holds in Phase 2, where a single IoU number can mask poor performance on touching or overlapping instances.
 
-**Pretrained models are a force multiplier under compute constraints.** With epoch times of 8–9 hours on the current hardware, the ability to start from a pretrained checkpoint and reach strong validation metrics in 20–30 epochs (instead of 150+) was critical. Fine-tuning was not just a shortcut — it was the correct engineering decision.
+**Pretrained models are a force multiplier under compute constraints.** With epoch times of 8–9 hours on the current hardware, the ability to start from a pretrained checkpoint and reach strong validation metrics in 20–30 epochs (instead of 150+) was critical in Phase 1. Fine-tuning was not just a shortcut — it was the correct engineering decision. Phase 2 takes this further: full SAM2 fine-tuning is not even attempted, since ablation showed it catastrophically forgets the general segmentation prior the open-set constraint depends on.
 
-**Composite noise training is non-negotiable for real-world deployment.** Single-noise-type training produces models that fail on real images. The switch to probabilistic composite noise augmentation (`new_augment_sem`) eliminated composite-noise test artifacts and is the single change most responsible for improved generalisation.
+**Composite noise training is non-negotiable for real-world deployment.** Single-noise-type training produces models that fail on real images. The switch to probabilistic composite noise augmentation (`new_augment_sem`) eliminated composite-noise test artifacts and is the single change most responsible for improved generalisation. This same noise engine is now reused as Phase 2's annotation augmentation pipeline.
 
-**GAN hallucination is a dealbreaker for scientific instruments.** pix2pixHD was briefly considered and rejected. A denoising model that invents surface features that were not present — even if they look plausible — is unacceptable in a measurement instrument context. Regression-based models with perceptual losses are conservative by design.
+**GAN hallucination is a dealbreaker for scientific instruments.** pix2pixHD was briefly considered and rejected in Phase 1. A denoising model that invents surface features that were not present — even if they look plausible — is unacceptable in a measurement instrument context. Regression-based models with perceptual losses are conservative by design.
+
+**Frozen-backbone adapter design generalises across phases.** Both Phase 1 (frozen encoder, trainable decoder) and Phase 2 (frozen SAM2, trainable GSEFE/MDFF adapters) converge on the same principle: when pretrained weights carry a strong domain-general prior worth preserving, train only the smallest sufficient adapter on top of it rather than the whole network.
+
+**Stale kernel cache produces phantom bugs.** In notebook-heavy development, errors that look like code bugs are often import cache issues from editing files without restarting the kernel; `%autoreload 2` is standard practice across both phases.
 
 ---
 
@@ -572,18 +685,27 @@ Once a dedicated CUDA-capable GPU is available:
 - [ ] **Production inference script** — clean standalone script taking image path as input, producing restored output; no notebook dependency
 - [ ] **Per-model comparative analysis** — side-by-side visual comparison of all four models on identical test images with per-image metrics
 
-### Phase 2 *(Planned)*
+### Phase 2A *(Current — Binary Open-Set Segmentation)*
 
-- [ ] Defect detection and feature segmentation (YOLOv8-seg + SAM2)
-- [ ] Deblurring model for focus-artifact correction
-- [ ] Super-resolution for sub-pixel detail recovery
-- [ ] Multimodal SE + BSE + EDS input fusion
+- [ ] Run frozen SAM (zero-shot) on real Bharat Atomic SEM images; assess merge/split failure rate per material class as a zero-training baseline
+- [ ] Annotate seed set (~200 source images, SAM-assisted human correction) and decide train/val split before annotation completes
+- [ ] Implement and train GSEFE and MDFF (isolated, then jointly) against the frozen-SAM baseline
+- [ ] Train Attention U-Net + FiLM and the RF-DETR / YOLOv11-seg secondary tracks on the same seed set
+- [ ] Full training runs on NVIDIA hardware with all architecture candidates
+- [ ] Production inference script — standalone, no notebook dependency, takes image path + material label as inputs
+
+### Phase 2B *(Planned — after hardware)*
+
+- [ ] Multi-class semantic segmentation with material-specific class taxonomies
+- [ ] Closed-set fast-path detector for high-volume customer material verticals
+- [ ] Phase 2.1 scale calibration and morphometric measurement pipeline
+- [ ] Multimodal SE + BSE + EDS (X-Ray) input fusion
 
 ### Phase 3 *(Planned)*
 
 - [ ] RL formulation for autonomous SEM parameter calibration
-- [ ] State encoder from Phase 1 denoiser + Phase 2 segmenter
-- [ ] Simulation environment for RL training before hardware deployment
+- [ ] State encoder from Phase 1 denoiser + Phase 2 segmenter as observation input to RL agent
+- [ ] Simulation environment for RL policy training before hardware deployment
 - [ ] Closed-loop testing on live SEM system
 
 ---
@@ -601,7 +723,13 @@ Once a dedicated CUDA-capable GPU is available:
 9. Lehtinen, J., et al. (2018). Noise2Noise: Learning image restoration without clean data. *ICML 2018*. arXiv:1803.04189.
 10. Buslaev, A., et al. (2020). Albumentations: Fast and flexible image augmentations. *Information*, 11(2), 125.
 11. Gurrola-Ramos, J., Dalmau, O., & Alarcón, T. E. (2021). A residual dense U-Net neural network for image denoising. *IEEE Access*, 9, 31742–31754.
+12. Qi, Y., Zhang, J., Kuang, J., Ren, T., Wang, D., Wu, Z., Zheng, H., & Zhang, Q. (2026). LBMS-SAM: Segment anything model guided SEM image segmentation for lithium battery materials. *Neural Networks*, 196, 108325.
+13. Kirillov, A., et al. (2023). Segment Anything. *Proceedings of the IEEE/CVF International Conference on Computer Vision*, 4015–4026.
+14. Archit, A., et al. (2025). Segment Anything for Microscopy. *Nature Methods*, 22, 579–591.
+15. Abebe, W., et al. (2024). SAM-I-Am: Semantic boosting for zero-shot atomic-scale electron micrograph segmentation. arXiv:2404.06638.
+16. Oquab, M., et al. (2024). DINOv2: Learning Robust Visual Features without Supervision. *Transactions on Machine Learning Research*.
+17. Rettenberger, L., et al. (2024). Uncertainty-aware particle segmentation for electron microscopy at varied length scales. *npj Computational Materials*, 10, 124.
 
 ---
 
-all weights and interactive models stored in google drive (https://drive.google.com/drive/folders/1rnN5juQu7kbgzvjLacVFdwx_7DZAfzIc?usp=sharing)
+All weights and interactive models are stored in Google Drive (https://drive.google.com/drive/folders/1rnN5juQu7kbgzvjLacVFdwx_7DZAfzIc?usp=sharing).
