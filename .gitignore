@@ -82,7 +82,7 @@ semPhase2/stuff
 semPhase2/main_folder/models/LBMS_SAM/SAM/weights
 semPhase2/main_folder/models/LBMS_SAM/sam2
 semPhase2/main_folder/models/LBMS_SAM/sam2/
-semPhase2/main_folder/models/LBMS_SAM/emps_dataset
+semPhase2/main_folder/emps_dataset/
 
 # Claude
 .claude/
