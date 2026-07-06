@@ -1,6 +1,6 @@
 # Bharat Atomic — AI-Driven SEM Image Enhancement Pipeline
 
-> **Internship Project** | Tejas Shrivastava | Bharat Atomic Labs
+> **Tejas Shrivastava | ML Intern | Bharat Atomic Labs
 >
 > *Real-time deep learning restoration of Scanning Electron Microscope (SEM) imagery — from synthetic noise engineering to production inference.*
 
