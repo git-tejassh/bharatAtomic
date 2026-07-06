@@ -88,6 +88,9 @@ semPhase2/main_folder/emps_dataset/
 .claude/
 CLAUDE.md
 get-pip.py
+.continue/
+
+
 
 ## ======================================
 ## ScratchPads, Notepads, Roughwork    ||

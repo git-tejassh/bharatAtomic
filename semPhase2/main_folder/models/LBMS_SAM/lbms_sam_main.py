@@ -13,6 +13,13 @@ from pycocotools import mask as mask_utils
 import base64
 import cv2
 import zlib
+import torch
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+from pycocotools.coco import COCO
+from PIL.Image import Image
+from lbms_mask_loss import LBMS_MaskLoss
+import torch.nn.functional as F
 
 path = '/Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/emps_dataset/emps-DatasetNinja (2)/ds/' 
 
@@ -235,7 +242,187 @@ class DataLoading():
         return splits
    
         
+        
 
+def sample_point_prompt(mask: np.ndarray) -> tuple[int, int]:
+    """Point deepest inside the mask -- more robust than a random foreground pixel."""
+    dist = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
+    y, x = np.unravel_index(np.argmax(dist), dist.shape)
+    return int(x), int(y)
+
+
+class LBMSCocoDataset(Dataset):
+    def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024):
+        self.coco = COCO(coco_json_path)
+        self.image_dir = image_dir
+        self.img_ids = list(self.coco.imgs.keys())
+        self.target_size = target_size
+
+    def __len__(self):
+        return len(self.img_ids)
+
+    def __getitem__(self, idx):
+        img_id = self.img_ids[idx]
+        img_info = self.coco.imgs[img_id]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+        if not anns:
+            raise ValueError(f"Image {img_id} ({img_info['file_name']}) has zero instances")
+
+        image = cv2.imread(f"{self.image_dir}/{img_info['file_name']}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
+
+        ann = anns[np.random.randint(len(anns))]
+        assert list(ann["segmentation"]["size"]) == [orig_h, orig_w], (
+            f"RLE size {ann['segmentation']['size']} != image size {(orig_h, orig_w)} "
+            f"for {img_info['file_name']} -- stale annotation or wrong image file"
+        )
+        gt_mask = mask_utils.decode(ann["segmentation"]).astype(np.float32)
+
+        # Prompt computed at ORIGINAL resolution, then scaled -- not the other way round
+        px, py = sample_point_prompt(gt_mask)
+        scale = self.target_size / max(orig_h, orig_w)
+        px_scaled, py_scaled = px * scale, py * scale
+
+        image_resized = cv2.resize(image, (int(orig_w * scale), int(orig_h * scale)))
+        mask_resized = cv2.resize(gt_mask, (int(orig_w * scale), int(orig_h * scale)),
+                                   interpolation=cv2.INTER_NEAREST)
+
+        # Pad up to target_size x target_size (SAM2 expects square input)
+        padded_image = np.zeros((self.target_size, self.target_size, 3), dtype=np.uint8)
+        padded_mask = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+        h, w = image_resized.shape[:2]
+        padded_image[:h, :w] = image_resized
+        padded_mask[:h, :w] = mask_resized
+
+        return {
+            "image": torch.from_numpy(padded_image).permute(2, 0, 1).float() / 255.0,
+            "point_coords": torch.tensor([[px_scaled, py_scaled]], dtype=torch.float32),
+            "point_labels": torch.tensor([1], dtype=torch.int32),
+            "gt_mask": torch.from_numpy(padded_mask),
+            "material_class": img_info.get("material_class", "unknown"),
+        }
     
 
-        
+def build_dataloader(
+    coco_root_dir: str,
+    target_size: int = 1024,
+    max_samples: int | None = None,
+    batch_size: int = 4,
+    shuffle: bool = True,
+    num_workers: int = 0,
+) -> DataLoader:
+    """
+    coco_root_dir is a split folder like COCO_format/train_dir, expected to contain:
+        coco_root_dir/img/<image files>
+        coco_root_dir/annotations.json
+    """
+    ann_file = os.path.join(coco_root_dir, "annotations.json")
+    image_dir = os.path.join(coco_root_dir, "img")
+ 
+    dataset = LBMSCocoDataset(
+        coco_json_path=ann_file,
+        image_dir=image_dir,
+        target_size=target_size,
+        max_samples=max_samples,
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+ 
+ 
+def train_one_epoch(model, dataloader, optimizer, loss_fn, device="cpu"):
+    """
+    loss_fn(outputs, batch) -> scalar tensor. Kept as a callback rather than
+    hardcoded here, since it depends on your model's actual output fields
+    (LBMSMaskLoss + IoU-head regression) which this generic loop shouldn't
+    need to know about.
+    """
+    model.train()
+    running_loss = 0.0
+ 
+    for step, batch in enumerate(dataloader):
+        images = batch["image"].to(device)
+        point_coords = batch["point_coords"].to(device)
+        point_labels = batch["point_labels"].to(device)
+        gt_masks = batch["gt_mask"].to(device)
+ 
+        optimizer.zero_grad()
+        outputs = model(
+            image=images,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=True,
+        )
+ 
+        loss = loss_fn(outputs, {"gt_mask": gt_masks, "material_class": batch["material_class"]})
+        loss.backward()
+        optimizer.step()
+ 
+        running_loss += loss.item()
+        print(f"  step {step + 1}/{len(dataloader)} | loss {loss.item():.4f}")
+ 
+    avg_loss = running_loss / max(len(dataloader), 1)
+    print(f"epoch avg loss: {avg_loss:.4f}")
+    return avg_loss
+ 
+ 
+def run_training(
+    coco_root_dir: str,
+    model,
+    optimizer,
+    loss_fn,
+    max_samples: int | None = 5,   # <-- the knob: small int for a smoke test, None for full dataset
+    num_epochs: int = 1,
+    batch_size: int = 1,
+    target_size: int = 256,
+    device: str = "cpu",
+):
+    """
+    Quick-test defaults: max_samples=5, num_epochs=1. To train on everything
+    later, call with max_samples=None, num_epochs=<real number>, and whatever
+    target_size/batch_size your real training config uses -- nothing else
+    in this function needs to change.
+    """
+    loader = build_dataloader(
+        coco_root_dir=coco_root_dir,
+        target_size=target_size,
+        max_samples=max_samples,
+        batch_size=batch_size,
+        shuffle=(max_samples is None),  # keep deterministic ordering while debugging on a subset
+    )
+ 
+    model.to(device)
+    for epoch in range(num_epochs):
+        print(f"--- epoch {epoch + 1}/{num_epochs} ({len(loader.dataset)} images) ---")
+        train_one_epoch(model, loader, optimizer, loss_fn, device=device)
+ 
+
+mask_loss_fn = LBMS_MaskLoss(lambda_dice = 1.0, lambda_focal = 1.0, lambda_bce = 1.0)
+
+def compute_iou(pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    pred_binary, gt_mask: (B, 1, H, W), both {0, 1} float or bool tensors.
+    Returns: (B, 1) IoU per sample, NOT reduced to a scalar -- this is a
+    per-sample regression target for the IoU head, not a batch-mean metric.
+    """
+    pred_binary = pred_binary.float()
+    gt_mask = gt_mask.float()
+
+    intersection = (pred_binary * gt_mask).sum(dim=(2, 3))
+    union = (pred_binary + gt_mask - pred_binary * gt_mask).sum(dim=(2, 3))
+    return intersection / (union + eps)
+
+
+def combined_loss(outputs, batch):
+    pred = outputs.masks[:,:1]
+    gt = batch['gt_mask'].unsqueeze(1)
+
+    mask_loss = mask_loss_fn(pred,gt)
+
+    with torch.no_grad():
+        pred_binary = (torch.sigmoid(pred)>0.5).float()
+        actual_iou = compute_iou(pred_binary, gt)
+        iou_loss = F.mse_loss(outputs.iou_pred[:,:1], actual_iou)
+
+    return mask_loss + iou_loss
+
