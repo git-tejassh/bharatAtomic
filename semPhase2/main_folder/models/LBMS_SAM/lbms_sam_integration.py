@@ -11,6 +11,7 @@ import SAM.modeling.backbones.image_encoder as img_enc
 from SAM.modeling.sam2_utils import MLP
 from SAM.modeling.backbones.image_encoder import ImageEncoder as image_encoder
 from SAM.modeling.sam.mask_decoder import MaskDecoder as mask_decoder
+from dataclasses import dataclass
 
 
 MASK_FEAT_CHANNELS = 32
@@ -356,9 +357,6 @@ class LBMSSAM2Integration(nn.Module):
  
         return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask_np, lbms_score_np
 
-
-
-from dataclasses import dataclass
         
 @dataclass 
 class LBMSTrainOutput:

@@ -370,7 +370,7 @@ class TrainingEval:
                 self.optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-8
             )
  
-    def train_one_epoch(self, model, device: str = 'cpu') -> float:
+    def train_one_epoch(self, loader: DataLoader) -> float:
         """
         Runs one training epoch over `loader`. loss_fn(outputs, batch) -> scalar
         tensor, where `outputs` is an LBMSTrainOutput (has .masks/.iou_pred),
@@ -378,27 +378,26 @@ class TrainingEval:
         forward(), which takes a single prompts dict and returns detached numpy.
         """
 
-        loader = DataLoader
         optimizer = self.optimizer
         loss_fn = self.loss_fn
         if optimizer is None:
             raise RuntimeError("train_one_epoch requires an optimizer; none was given to TrainingEval.")
- 
-        model.train()
+
+        self.model.train()
         running_loss = 0.0
- 
+
         for step, batch in enumerate(loader):
-            images = batch["image"].to(device)
-            point_coords = batch["point_coords"].to(device)
-            point_labels = batch["point_labels"].to(device)
-            gt_masks = batch["gt_mask"].to(device)
+            images = batch["image"].to(self.device)
+            point_coords = batch["point_coords"].to(self.device)
+            point_labels = batch["point_labels"].to(self.device)
+            gt_masks = batch["gt_mask"].to(self.device)
             material_class = batch["material_class"]
             if torch.is_tensor(material_class):
-                material_class = material_class.to(device)
- 
+                material_class = material_class.to(self.device)
+
             optimizer.zero_grad()
-            outputs = model.forward_train(
-                image=images,
+            outputs = self.model.forward_train(
+                images=images,
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=True,
@@ -408,7 +407,7 @@ class TrainingEval:
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
-            print(f"  step {step + 1}/{len(loader)} | loss {loss.item():.4f}")
+            print(f"  batch {step + 1}/{len(loader)} | loss {loss.item():.4f}")
  
         avg_loss = running_loss / max(len(loader), 1)
         print(f"epoch avg loss: {avg_loss:.4f}")
@@ -462,20 +461,20 @@ class TrainingEval:
  
  
     @torch.no_grad()
-    def evaluate(self, model, loader: DataLoader, loss_fn, device = 'cpu') -> float:
+    def evaluate(self, loader: DataLoader) -> float:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
-        model.eval()
+        self.model.eval()
         running_loss = 0.0
         for batch in loader:
-            images = batch["image"].to(device)
-            point_coords = batch["point_coords"].to(device)
-            point_labels = batch["point_labels"].to(device)
-            gt_masks = batch["gt_mask"].to(device)
+            images = batch["image"].to(self.device)
+            point_coords = batch["point_coords"].to(self.device)
+            point_labels = batch["point_labels"].to(self.device)
+            gt_masks = batch["gt_mask"].to(self.device)
             material_class = batch["material_class"]
             if torch.is_tensor(material_class):
-                material_class = material_class.to(device)
- 
-            outputs = model.forward_train(
+                material_class = material_class.to(self.device)
+
+            outputs = self.model.forward_train(
                 image=images,
                 point_coords=point_coords,
                 point_labels=point_labels,
@@ -486,7 +485,6 @@ class TrainingEval:
  
         return running_loss / max(len(loader), 1)
     
-    @staticmethod
     def save_trainable_state(self, path: str) -> None:
         """
         Saves only params with requires_grad=True (your adapter weights --
@@ -529,7 +527,7 @@ class TrainingEval:
         best_val_loss = float("inf")
  
         for epoch in range(num_epochs):
-            print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
+            print(f"\n============================== Epoch {epoch + 1}/{num_epochs} ==============================")
  
             train_loss = self.train_one_epoch(train_loader)
             history["train_loss"].append(train_loss)
