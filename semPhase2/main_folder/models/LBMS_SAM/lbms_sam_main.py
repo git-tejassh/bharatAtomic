@@ -15,13 +15,13 @@ import base64
 import cv2
 import zlib
 import torch
+import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from pycocotools.coco import COCO
 from PIL.Image import Image
 from lbms_mask_loss import LBMS_MaskLoss
 import torch.nn.functional as F
-from lbms_sam_main import combined_loss
 
 path = '/Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/emps_dataset/emps-DatasetNinja (2)/ds/' 
 
@@ -254,11 +254,17 @@ def sample_point_prompt(mask: np.ndarray) -> tuple[int, int]:
 
 
 class LBMSCocoDataset(Dataset):
-    def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024):
+    def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024, 
+                 max_samples: Optional[int] = None):
         self.coco = COCO(coco_json_path)
         self.image_dir = image_dir
         self.img_ids = list(self.coco.imgs.keys())
+
+        if max_samples is not None:
+            self.img_ids = self.img_ids[:max_samples]
+
         self.target_size = target_size
+        
 
     def __len__(self):
         return len(self.img_ids)
@@ -329,14 +335,12 @@ def build_dataloader(
         coco_json_path=ann_file,
         image_dir=image_dir,
         target_size=target_size,
-        max_samples=max_samples,
     )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
  
 
 
 class TrainingEval:
-
     def __init__(
         self,
         model,
@@ -345,61 +349,72 @@ class TrainingEval:
         device: str = "cpu",
     ):
         self.model = model
-        self.optimizer = optimizer
+        # If no optimizer is passed, default to Adam over trainable (adapter) params only.
+        # If one IS passed, use it as-is -- do not silently override it (this used to
+        # discard any optimizer you passed in and hardcode lr=1e-4 regardless).
+        self.optimizer = optimizer if optimizer is not None else optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4
+        )
         self.device = device
-
+ 
         # Build mask_loss_fn before resolving the default loss_fn, since the
         # default (self.combined_loss) depends on it.
         self.mask_loss_fn = LBMS_MaskLoss(lambda_dice=1.0, lambda_focal=1.0, lambda_bce=1.0)
         self.loss_fn = loss_fn if loss_fn is not None else self.combined_loss
-
+ 
         self.model.to(self.device)
-
+ 
         self.scheduler = None
         if self.optimizer is not None:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-8
             )
+ 
+    def train_one_epoch(self, model, device: str = 'cpu') -> float:
+        """
+        Runs one training epoch over `loader`. loss_fn(outputs, batch) -> scalar
+        tensor, where `outputs` is an LBMSTrainOutput (has .masks/.iou_pred),
+        the return type of model.forward_train() -- NOT the inference-only
+        forward(), which takes a single prompts dict and returns detached numpy.
+        """
 
-    def train_one_epoch(self, loader: DataLoader) -> float:
-        """
-        Runs one training epoch over `loader` using self.model / self.optimizer
-        / self.loss_fn / self.device. loss_fn(outputs, batch) -> scalar tensor,
-        kept as an instance attribute (default self.combined_loss) since it
-        depends on the model's actual output fields.
-        """
-        if self.optimizer is None:
+        loader = DataLoader
+        optimizer = self.optimizer
+        loss_fn = self.loss_fn
+        if optimizer is None:
             raise RuntimeError("train_one_epoch requires an optimizer; none was given to TrainingEval.")
-
-        self.model.train()
+ 
+        model.train()
         running_loss = 0.0
-    
-        for step, batch in enumerate(self.dataloader):
-            images = batch["image"].to(self.device)
-            point_coords = batch["point_coords"].to(self.device)
-            point_labels = batch["point_labels"].to(self.device)
-            gt_masks = batch["gt_mask"].to(self.device)
-    
-            self.optimizer.zero_grad()
-            outputs = self.model(
+ 
+        for step, batch in enumerate(loader):
+            images = batch["image"].to(device)
+            point_coords = batch["point_coords"].to(device)
+            point_labels = batch["point_labels"].to(device)
+            gt_masks = batch["gt_mask"].to(device)
+            material_class = batch["material_class"]
+            if torch.is_tensor(material_class):
+                material_class = material_class.to(device)
+ 
+            optimizer.zero_grad()
+            outputs = model.forward_train(
                 image=images,
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=True,
             )
-    
-            loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": batch["material_class"]})
+ 
+            loss = loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
             loss.backward()
-            self.optimizer.step()
-    
+            optimizer.step()
             running_loss += loss.item()
-            print(f"  step {step + 1}/{len(self.dataloader)} | loss {loss.item():.4f}")
-    
-        avg_loss = running_loss / max(len(self.dataloader), 1)
+            print(f"  step {step + 1}/{len(loader)} | loss {loss.item():.4f}")
+ 
+        avg_loss = running_loss / max(len(loader), 1)
         print(f"epoch avg loss: {avg_loss:.4f}")
         return avg_loss
     
-
+ 
     def compute_iou(self, pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         """
         pred_binary, gt_mask: (B, 1, H, W), both {0, 1} float or bool tensors.
@@ -408,12 +423,12 @@ class TrainingEval:
         """
         pred_binary = pred_binary.float()
         gt_mask = gt_mask.float()
-
+ 
         intersection = (pred_binary * gt_mask).sum(dim=(2, 3))
         union = (pred_binary + gt_mask - pred_binary * gt_mask).sum(dim=(2, 3))
         return intersection / (union + eps)
-
-
+ 
+ 
     def combined_loss(self, outputs, batch):
         """
         Default loss_fn. Picks the best of the multimask_output=True mask
@@ -425,59 +440,62 @@ class TrainingEval:
             gt = gt.unsqueeze(1)                      # (B,H,W) -> (B,1,H,W)
         elif gt.dim() != 4 or gt.shape[1] != 1:
             raise ValueError(f"expected gt_mask shaped (B,H,W) or (B,1,H,W), got {tuple(gt.shape)}")
-
+ 
         pred_masks = outputs.masks           # (B, num_masks, H, W)
         iou_pred = outputs.iou_pred          # (B, num_masks)
         num_masks = pred_masks.shape[1]
-
+ 
         with torch.no_grad():
             pred_binary = (torch.sigmoid(pred_masks) > 0.5).float()
             gt_expanded = gt.expand(-1, num_masks, -1, -1)
             ious = self.compute_iou(pred_binary, gt_expanded)     # (B, num_masks)
             best_idx = ious.argmax(dim=1)                          # (B,)
-
+ 
         batch_idx = torch.arange(pred_masks.shape[0], device=pred_masks.device)
         best_mask = pred_masks[batch_idx, best_idx].unsqueeze(1)       # (B,1,H,W)
         best_iou_pred = iou_pred[batch_idx, best_idx].unsqueeze(1)     # (B,1)
         best_actual_iou = ious[batch_idx, best_idx].unsqueeze(1)       # (B,1)
-
+ 
         mask_loss = self.mask_loss_fn(best_mask, gt)
         iou_loss = F.mse_loss(best_iou_pred, best_actual_iou)
         return mask_loss + iou_loss
-
-
+ 
+ 
     @torch.no_grad()
-    def evaluate(self, model, dataloader, loss_fn, device="cpu"):
+    def evaluate(self, model, loader: DataLoader, loss_fn, device = 'cpu') -> float:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
-        self.model.eval()
+        model.eval()
         running_loss = 0.0
-        for batch in dataloader:
+        for batch in loader:
             images = batch["image"].to(device)
             point_coords = batch["point_coords"].to(device)
             point_labels = batch["point_labels"].to(device)
             gt_masks = batch["gt_mask"].to(device)
-    
-            outputs = model(
+            material_class = batch["material_class"]
+            if torch.is_tensor(material_class):
+                material_class = material_class.to(device)
+ 
+            outputs = model.forward_train(
                 image=images,
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=True,
             )
-            loss = loss_fn(outputs, {"gt_mask": gt_masks, "material_class": batch["material_class"]})
+            loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
             running_loss += loss.item()
+ 
+        return running_loss / max(len(loader), 1)
     
-        return running_loss / max(len(dataloader), 1)
-    
-    
-    def save_trainable_state(model, path):
+    @staticmethod
+    def save_trainable_state(self, path: str) -> None:
         """
         Saves only params with requires_grad=True (your adapter weights --
         ~1.3M params), not the frozen SAM2 backbone. Assumes you've already
-        set requires_grad correctly on the model before calling train_model.
+        set requires_grad correctly on self.model before calling train_model.
         """
         trainable_state = {
             name: param.detach().cpu()
-            for name, param in model.named_parameters()
+            for name, param in self.model.named_parameters()
             if param.requires_grad
         }
         if not trainable_state:
@@ -485,73 +503,73 @@ class TrainingEval:
         torch.save(trainable_state, path)
     
     
-    def train_model(self,
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        loss_fn,
+    def train_model(
+        self,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
         num_epochs: int = 1,
-        device: str = "cpu",
         checkpoint_path: Optional[str] = None,
-    ):
+    ) -> dict:
         """
-        Full train+val loop. Assumes you've already frozen the SAM2 backbone and
-        left GSEFE/MDFF/FeatureFusion adapter params trainable -- this function
-        doesn't touch requires_grad, it just respects whatever's already set.
-    
+        Full train+val loop, using self.model / self.optimizer / self.loss_fn /
+        self.device (set in __init__). Assumes you've already frozen the SAM2
+        backbone and left GSEFE/MDFF/FeatureFusion adapter params trainable --
+        this function doesn't touch requires_grad, it just respects whatever's
+        already set.
+ 
         val_loader should be built with deterministic=True (see build_dataloader)
         so val_loss is actually comparable across epochs.
-    
+ 
         If checkpoint_path is given, saves adapter-only weights whenever val_loss
         improves. Pass val_loader=None to skip validation entirely (e.g. for a
         quick train-only smoke test on a couple of images).
         """
-        model.to(device)
+        self.model.to(self.device)
         history = {"train_loss": [], "val_loss": []}
         best_val_loss = float("inf")
-    
+ 
         for epoch in range(num_epochs):
             print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
-    
-            model.train()
-            train_loss = self.train_one_epoch(model, train_loader, optimizer, loss_fn, device=device)
+ 
+            train_loss = self.train_one_epoch(train_loader)
             history["train_loss"].append(train_loss)
-    
+ 
             if val_loader is not None:
-                val_loss = self.evaluate(model, val_loader, loss_fn, device=device)
+                val_loss = self.evaluate(val_loader)
                 history["val_loss"].append(val_loss)
                 print(f"epoch {epoch + 1}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
-                
+ 
                 if self.scheduler is not None:
                     self.scheduler.step(val_loss)
-    
+ 
                 if checkpoint_path is not None and val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    self.save_trainable_state(model, checkpoint_path)
+                    self.save_trainable_state(checkpoint_path)
                     print(f"  -> new best val_loss, saved adapter weights to {checkpoint_path}")
             else:
                 print(f"epoch {epoch + 1}: train_loss={train_loss:.4f}  (no val_loader given)")
-    
+ 
         return history
     
     
-    def run_training(self,
+    def run_training(
+        self,
         coco_root_dir: str,
-        model,
-        optimizer,
-        loss_fn,
         max_samples: Optional[int] = 5,   # <-- the knob: small int for a smoke test, None for full dataset
         num_epochs: int = 1,
         batch_size: int = 1,
         target_size: int = 256,
-        device: str = "cpu",
-    ):
+        checkpoint_path: Optional[str] = None,
+    ) -> dict:
         """
-        Quick-test defaults: max_samples=5, num_epochs=1. To train on everything
-        later, call with max_samples=None, num_epochs=<real number>, and whatever
-        target_size/batch_size your real training config uses -- nothing else
-        in this function needs to change.
+        Convenience wrapper: builds a train-only loader from a COCO root and
+        runs train_model. Quick-test defaults: max_samples=5, batch_size=1,
+        target_size=256, num_epochs=1. For real training, pass max_samples=None
+        and your production batch_size/target_size/num_epochs.
+ 
+        NOTE: builds one loader only, no validation split. If you need val_loss
+        / checkpointing against a held-out set, build train_loader and val_loader
+        yourself (build_dataloader) and call self.train_model(...) directly.
         """
         loader = build_dataloader(
             coco_root_dir=coco_root_dir,
@@ -560,11 +578,13 @@ class TrainingEval:
             batch_size=batch_size,
             shuffle=(max_samples is None),  # keep deterministic ordering while debugging on a subset
         )
-    
-        model.to(device)
-        for epoch in range(num_epochs):
-            print(f"--- epoch {epoch + 1}/{num_epochs} ({len(loader.dataset)} images) ---")
-            self.train_one_epoch(model, loader, optimizer, loss_fn, device=device)
  
-
+        print(f"training on {len(loader.dataset)} images")
+        return self.train_model(
+            train_loader=loader,
+            val_loader=None,
+            num_epochs=num_epochs,
+            checkpoint_path=checkpoint_path,
+        )
+ 
 

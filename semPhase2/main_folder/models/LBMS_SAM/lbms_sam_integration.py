@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +15,21 @@ from SAM.modeling.sam.mask_decoder import MaskDecoder as mask_decoder
 
 MASK_FEAT_CHANNELS = 32
 HIERA_BPLUS_STAGE_CHANNELS = [112, 224, 448, 896]
+
+
+@dataclass
+class LBMSTrainOutput:
+    """
+    forward_train()'s return type. `masks`/`iou_pred` are named to match
+    what TrainingEval.combined_loss (lbms_sam_main.py) reads via attribute
+    access -- unlike forward()'s inference-only return tuple, everything
+    here is still attached to the autograd graph (no .detach()/.numpy()).
+    """
+    masks: torch.Tensor        # (B, N, H, W) LBMS mask logits, gt-resolution
+    iou_pred: torch.Tensor     # (B, N) LBMS stability scores
+    sam_masks: torch.Tensor    # (B, N, H, W) frozen SAM masks (logits or bool), for reference
+    sam_scores: torch.Tensor   # (B, N) frozen SAM iou predictions
+    mask_feats: torch.Tensor   # (B, C, h, w) SAM decoder's upscaled mask features
 
 
 class LBMSSAM2Integration(nn.Module):
@@ -38,12 +55,12 @@ class LBMSSAM2Integration(nn.Module):
 
 
 
-        self.iou_prediction_head = MLP(
-            transformer_dim,
-            iou_head_hidden_dim,
-            self.num_mask_tokens,
-            iou_head_depth,
-            sigmoid_output=iou_prediction_use_sigmoid,)
+        # self.iou_prediction_head = MLP(
+        #     transformer_dim,
+        #     iou_head_hidden_dim,
+        #     self.num_mask_tokens,
+        #     iou_head_depth,
+        #     sigmoid_output=iou_prediction_use_sigmoid,)
     
 
         # self.gsefe = GSEFE(in_channels=3, out_channels=self.mask_feat_channels)
@@ -117,6 +134,146 @@ class LBMSSAM2Integration(nn.Module):
         area_i = torch.sum(mask_logits > stability_delta, dim=-1).float()
         area_u = torch.sum(mask_logits > -stability_delta, dim=-1).float()
         return torch.where(area_u > 0, area_i / area_u, 1.0)
+    
+
+    def _fuse_lbms_masks(self, mask_feats, mdff_output, gsefe_output, output_tokens, multimask_output):
+        """
+        Shared by forward() (inference) and forward_train(): runs the
+        trainable GSEFE/MDFF/FeatureFusion path over each requested SAM
+        output token. Returns (masks, stability_scores), both still
+        attached to the autograd graph -- callers decide whether/when to
+        detach.
+        """
+        tok_range = range(1, self.num_mask_tokens) if multimask_output else range(0, 1)
+        delta = 1.0
+        lbms_masks_list = []
+        lbms_scores_list = []
+
+        for tok_idx in tok_range:
+            token = output_tokens[:, tok_idx, :]          # (B, 256)
+            lbms_mask_i = self.fusion(
+                mask_feats, mdff_output, gsefe_output, token
+            )                                              # (B, H_latent, W_latent)
+
+            # Stability score per mask
+            flat = lbms_mask_i.flatten(-2)                # (B, H*W)
+            area_i = (flat > delta).float().sum(-1)
+            area_u = (flat > -delta).float().sum(-1)
+            score_i = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
+
+            lbms_masks_list.append(lbms_mask_i)
+            lbms_scores_list.append(score_i)
+
+        lbms_masks_tensor = torch.stack(lbms_masks_list, dim=1)   # (B, N, H, W)
+        lbms_scores_tensor = torch.stack(lbms_scores_list, dim=1) # (B, N)
+        return lbms_masks_tensor, lbms_scores_tensor
+
+    def forward_train(self, images, point_coords, point_labels, multimask_output=True):
+        """
+        Training-mode forward path. Unlike forward(), this:
+          - takes batched tensors directly (no set_image() call, no
+            SAM2ImagePredictor numpy/single-image wrapper),
+          - never detaches or converts to numpy, so gradients reach
+            self.gsefe / self.mdff / self.fusion via loss.backward().
+
+        images:       (B, 3, H, W) float tensor in [0, 1], NOT SAM-normalized
+                       (this is the raw dataloader image -- GSEFE consumes it
+                       directly, same as forward()'s self.image_tensor).
+        point_coords: (B, N, 2) float tensor, pixel coords in `images`' frame.
+        point_labels: (B, N) int tensor (1 = fg, 0 = bg, -1 = pad).
+
+        Returns an LBMSTrainOutput. The frozen SAM encoder/prompt-encoder/
+        mask-decoder path runs under torch.no_grad() (mirroring
+        SAM2ImagePredictor.set_image()/predict(), which are @torch.no_grad()
+        themselves) -- only GSEFE/MDFF/FeatureFusion, which own trainable
+        parameters, run with grad tracking enabled.
+        """
+        device = self.sam2.device
+        images = images.to(device)
+        orig_hw = tuple(images.shape[-2:])
+
+        with torch.no_grad():
+            # Batched equivalent of SAM2ImagePredictor.set_image(): resize +
+            # normalize, run the image encoder, and reshape backbone feats --
+            # SAM2ImagePredictor itself only exposes a batch-size-1 API via
+            # set_image(), but the underlying model methods are batch-native.
+            input_image = self.sam2._transforms.transforms(images)
+
+            backbone_out = self.sam2.model.forward_image(input_image)
+            _, vision_feats, _, _ = self.sam2.model._prepare_backbone_features(backbone_out)
+            if self.sam2.model.directly_add_no_mem_embed:
+                vision_feats[-1] = vision_feats[-1] + self.sam2.model.no_mem_embed
+
+            feats = [
+                feat.permute(1, 2, 0).view(images.shape[0], -1, *feat_size)
+                for feat, feat_size in zip(vision_feats[::-1], self.sam2._bb_feat_sizes[::-1])
+            ][::-1]
+            image_embed, high_res_feats = feats[-1], feats[:-1]
+
+            # Raw per-stage trunk features for MDFF (see FIX #2 in __init__ --
+            # NOT the neck-projected backbone_fpn).
+            hierarchical_features = self.image_encoder.trunk(input_image)
+
+            point_coords_t = point_coords.to(device).float()
+            point_labels_t = point_labels.to(device).int()
+            unnorm_coords = self.sam2._transforms.transform_coords(
+                point_coords_t, normalize=True, orig_hw=orig_hw
+            )
+
+            sparse_embeddings, dense_embeddings = self.sam2.model.sam_prompt_encoder(
+                points=(unnorm_coords, point_labels_t),
+                boxes=None,
+                masks=None,
+            )
+
+            decoder_out = self.sam2.model.sam_mask_decoder(
+                image_embeddings=image_embed,
+                image_pe=self.sam2.model.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=False,  # images are already batched, one point-set each
+                high_res_features=(
+                    high_res_feats if self.sam2.model.use_high_res_features_in_sam else None
+                ),
+            )
+
+        sam_masks = decoder_out.masks
+        sam_scores = decoder_out.iou_pred
+        mask_feats = decoder_out.mask_feat
+        output_tokens = decoder_out.output_tokens
+        target_hw = mask_feats.shape[-2:]
+
+        '''GSEFE'''
+        gsefe_output = self.gsefe(images)
+        if gsefe_output.shape[-2:] != target_hw:
+            gsefe_output = F.interpolate(
+                gsefe_output, size=target_hw, mode="bilinear", align_corners=False
+            )
+
+        '''MDFF'''
+        mdff_output = self.mdff(hierarchical_features)
+        if mdff_output.shape[-2:] != target_hw:
+            mdff_output = F.interpolate(
+                mdff_output, size=target_hw, mode="bilinear", align_corners=False
+            )
+
+        '''Feature Fusion'''
+        lbms_masks_tensor, lbms_scores_tensor = self._fuse_lbms_masks(
+            mask_feats, mdff_output, gsefe_output, output_tokens, multimask_output
+        )
+
+        lbms_mask_upscaled = self.sam2._transforms.postprocess_masks(
+            lbms_masks_tensor, orig_hw
+        )  # (B, N, H, W) logits, still on the autograd graph
+
+        return LBMSTrainOutput(
+            masks=lbms_mask_upscaled,
+            iou_pred=lbms_scores_tensor,
+            sam_masks=sam_masks,
+            sam_scores=sam_scores,
+            mask_feats=mask_feats,
+        )
 
     def forward(self, prompts):
         image_tensor = self.image_tensor
@@ -157,19 +314,6 @@ class LBMSSAM2Integration(nn.Module):
             )
 
         multimask_output = prompts.get("multimask_output", True)
-        tok_range = range(1, self.num_mask_tokens) if multimask_output else range(0, 1)
-        delta = 1.0
-        lbms_masks_list = []
-        lbms_scores_list = []
-
-        '''Feature Fusion'''
-        # FIX #5: dropped the stray `mask_feats_channels` int that was being
-        # passed as a positional arg (arity mismatch against FeatureFusion's
-        # real 4-param signature), and kept argument order matching
-        # FeatureFusion.forward(mask_feat, denoised_feat, edge_feat, output_token).
-
-
-
         '''
         WHEN ENOUGH DATA (GROUND TRUTH) IS AVAILABLE, ADD A TRAINABLE IOU HEAD TO PREDICT THE QUALITY OF THE LBMS MASKS, 
         SIMILAR TO SAM'S IOU HEAD. THIS WILL ALLOW US TO SELECT THE BEST MASK AMONG MULTIPLE OUTPUTS.
@@ -183,24 +327,11 @@ class LBMSSAM2Integration(nn.Module):
         # In forward(), after fusion:
         lbms_score = self.lbms_iou_head(output_tokens_fused).squeeze(-1)  # (B,)
         '''
-        
-        for tok_idx in tok_range:
-            token = output_tokens[:, tok_idx, :]          # (B, 256)
-            lbms_mask_i = self.fusion(
-                mask_feats, mdff_output, gsefe_output, token
-            )                                              # (B, H_latent, W_latent)
 
-            # Stability score per mask
-            flat = lbms_mask_i.flatten(-2)                # (B, H*W)
-            area_i = (flat > delta).float().sum(-1)
-            area_u = (flat > -delta).float().sum(-1)
-            score_i = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
+        lbms_masks_tensor, lbms_scores_tensor = self._fuse_lbms_masks(
+            mask_feats, mdff_output, gsefe_output, output_tokens, multimask_output
+        )
 
-            lbms_masks_list.append(lbms_mask_i)
-            lbms_scores_list.append(score_i)
-        
-        lbms_masks_tensor = torch.stack(lbms_masks_list, dim=1)   # (B, N, H, W)
-        lbms_scores_tensor = torch.stack(lbms_scores_list, dim=1) # (B, N)
 
         lbms_mask_upscaled = self.sam2._transforms.postprocess_masks(
             lbms_masks_tensor,
@@ -227,7 +358,23 @@ class LBMSSAM2Integration(nn.Module):
 
 
 
+from dataclasses import dataclass
         
+@dataclass 
+class LBMSTrainOutput:
+    """
+    forward_train()'s return type. `masks`/`iou_pred` are named to match
+    what TrainingEval.combined_loss (lbms_sam_main.py) reads via attribute
+    access -- unlike forward()'s inference-only return tuple, everything
+    here is still attached to the autograd graph (no .detach()/.numpy()).
+    """
+    masks: torch.Tensor        # (B, N, H, W) LBMS mask logits, gt-resolution
+    iou_pred: torch.Tensor     # (B, N) LBMS stability scores
+    sam_masks: torch.Tensor    # (B, N, H, W) frozen SAM masks (logits or bool), for reference
+    sam_scores: torch.Tensor   # (B, N) frozen SAM iou predictions
+    mask_feats: torch.Tensor   # (B, C, h, w) SAM decoder's upscaled mask features
+
+
         
 
 
