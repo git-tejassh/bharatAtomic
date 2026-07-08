@@ -461,11 +461,11 @@ class TrainingEval:
  
  
     @torch.no_grad()
-    def evaluate(self, loader: DataLoader) -> float:
+    def evaluate(self, loader: DataLoader, test = False) -> float:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
         self.model.eval()
         running_loss = 0.0
-        for batch in loader:
+        for step , batch in enumerate(loader):
             images = batch["image"].to(self.device)
             point_coords = batch["point_coords"].to(self.device)
             point_labels = batch["point_labels"].to(self.device)
@@ -475,15 +475,28 @@ class TrainingEval:
                 material_class = material_class.to(self.device)
 
             outputs = self.model.forward_train(
-                image=images,
+                images=images,
                 point_coords=point_coords,
                 point_labels=point_labels,
                 multimask_output=True,
             )
             loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
             running_loss += loss.item()
- 
-        return running_loss / max(len(loader), 1)
+
+                    
+
+        return outputs, running_loss / max(len(loader), 1)
+    
+
+    def eval_one(self, image):
+        self.model.eval()
+        image = Image.open(image)
+        image = np.array(image.convert('RGB'))
+
+        plt.figure(figsize=(10,10))
+        plt.imshow(image) 
+        plt.axis('on')
+        plt.show
     
     def save_trainable_state(self, path: str) -> None:
         """
@@ -586,3 +599,62 @@ class TrainingEval:
         )
  
 
+class Testing:
+    def __init__(self,
+                 model,
+                 loss_fn : Optional[Callable] = None,
+                 device: str = 'cpu',):
+        self.model = model
+        self.device = device
+        
+        
+        self.mask_loss_fn = LBMS_MaskLoss(lambda_dice=1.0, lambda_focal=1.0, lambda_bce=1.0)
+        self.loss_fn = loss_fn if loss_fn is not None else self.combined_loss
+ 
+        self.model.to(self.device)
+
+    def test_one_image(self):
+        pass
+
+    def test_batch(self, loader:DataLoader) -> float:
+        loss_fn = self.loss_fn
+        self.model.eval()
+        running_loss = 0.0
+
+        for step, batch in enumerate(loader):
+            images = batch['image'].to(self.device)
+            point_coords = batch["point_coords"].to(self.device)
+            point_labels = batch["point_labels"].to(self.device)
+            gt_masks = batch["gt_mask"].to(self.device)
+            material_class = batch["material_class"]
+            if torch.is_tensor(material_class):
+                material_class = material_class.to(self.device)
+
+            outputs = self.model.forward_train(
+                images=images,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+ 
+            loss = loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
+            running_loss += loss.item()
+            print(f"  batch {step + 1}/{len(loader)} | loss {loss.item():.4f}")
+ 
+        avg_loss = running_loss / max(len(loader), 1)
+        print(f"epoch avg loss: {avg_loss:.4f}")
+        return avg_loss
+    
+    def compute_iou(self, pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        
+        """
+        pred_binary, gt_mask: (B, 1, H, W), both {0, 1} float or bool tensors.
+        Returns: (B, 1) IoU per sample, NOT reduced to a scalar -- this is a
+        per-sample regression target for the IoU head, not a batch-mean metric.
+        """
+        pred_binary = pred_binary.float()
+        gt_mask = gt_mask.float()
+ 
+        intersection = (pred_binary * gt_mask).sum(dim=(2, 3))
+        union = (pred_binary + gt_mask - pred_binary * gt_mask).sum(dim=(2, 3))
+        return intersection / (union + eps)
