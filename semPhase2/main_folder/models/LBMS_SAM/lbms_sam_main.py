@@ -421,6 +421,7 @@ def evaluate_on_ann_file(
 
     return results
 
+
 def rank_masks_by_iou(
     lbms_sam,
     image: np.ndarray,        # RGB array, the SAME image already passed to lbms_sam.set_image()
@@ -593,8 +594,6 @@ class LBMSCocoDataset(Dataset):
         }
     
 
-
-
 def build_dataloader(
     coco_root_dir: str,
     target_size: int = 1024,
@@ -624,21 +623,15 @@ class TrainingEval:
     def __init__(
         self,
         model,
-        optimizer: Optional[torch.optim.Optimizer] = None,
         loss_fn: Optional[Callable] = None,
         device: str = "cpu",
-    ):
+        ):
+        
         self.model = model
-        # If no optimizer is passed, default to Adam over trainable (adapter) params only.
-        # If one IS passed, use it as-is -- do not silently override it (this used to
-        # discard any optimizer you passed in and hardcode lr=1e-4 regardless).
-        self.optimizer = optimizer if optimizer is not None else optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4
-        )
+        self.optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
         self.device = device
  
-        # Build mask_loss_fn before resolving the default loss_fn, since the
-        # default (self.combined_loss) depends on it.
         self.mask_loss_fn = LBMS_MaskLoss(lambda_dice=1.0, lambda_focal=1.0, lambda_bce=1.0)
         self.loss_fn = loss_fn if loss_fn is not None else self.combined_loss
  
@@ -660,7 +653,7 @@ class TrainingEval:
 
         optimizer = self.optimizer
         loss_fn = self.loss_fn
-        if optimizer is None:
+        if self.optimizer is None:
             raise RuntimeError("train_one_epoch requires an optimizer; none was given to TrainingEval.")
 
         self.model.train()
@@ -914,63 +907,3 @@ class TrainingEval:
             checkpoint_path=checkpoint_path,
         )
  
-
-
-    def __init__(self,
-                 model,
-                 loss_fn : Optional[Callable] = None,
-                 device: str = 'cpu',):
-        self.model = model
-        self.device = device
-        
-        
-        self.mask_loss_fn = LBMS_MaskLoss(lambda_dice=1.0, lambda_focal=1.0, lambda_bce=1.0)
-        self.loss_fn = loss_fn if loss_fn is not None else self.combined_loss
- 
-        self.model.to(self.device)
-
-    def test_one_image(self):
-        pass
-
-    def test_batch(self, loader:DataLoader) -> float:
-        loss_fn = self.loss_fn
-        self.model.eval()
-        running_loss = 0.0
-
-        for step, batch in enumerate(loader):
-            images = batch['image'].to(self.device)
-            point_coords = batch["point_coords"].to(self.device)
-            point_labels = batch["point_labels"].to(self.device)
-            gt_masks = batch["gt_mask"].to(self.device)
-            material_class = batch["material_class"]
-            if torch.is_tensor(material_class):
-                material_class = material_class.to(self.device)
-
-            outputs = self.model.forward_train(
-                images=images,
-                point_coords=point_coords,
-                point_labels=point_labels,
-                multimask_output=True,
-            )
- 
-            loss = loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
-            running_loss += loss.item()
-            print(f"  batch {step + 1}/{len(loader)} | loss {loss.item():.4f}")
- 
-        avg_loss = running_loss / max(len(loader), 1)
-        print(f"epoch avg loss: {avg_loss:.4f}")
-        return avg_loss
-    
-    def compute_iou(self, pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        
-        """
-        pred_binary, gt_mask: (B, 1, H, W), both {0, 1} float or bool tensors.
-        Returns: (B, 1) IoU per sample, NOT reduced to a scalar -- this is a
-        per-sample regression target for the IoU head, not a batch-mean metric.
-        """
-        pred_binary = pred_binary.float()
-        gt_mask = gt_mask.float()
- 
-        intersection = (pred_binary * gt_mask).sum(dim=(2, 3))
-        union = (pred_binary + gt_mask - pred_binary * gt_mask).sum(dim=(2, 3))
-        return intersection / (union + eps)
