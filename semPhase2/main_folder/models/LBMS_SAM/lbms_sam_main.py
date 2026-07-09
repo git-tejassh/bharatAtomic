@@ -411,7 +411,7 @@ class TrainingEval:
  
         avg_loss = running_loss / max(len(loader), 1)
         print(f"epoch avg loss: {avg_loss:.4f}")
-        return avg_loss
+        return outputs, avg_loss
     
  
     def compute_iou(self, pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -542,13 +542,13 @@ class TrainingEval:
         for epoch in range(num_epochs):
             print(f"\n============================== Epoch {epoch + 1}/{num_epochs} ==============================")
  
-            train_loss = self.train_one_epoch(train_loader)
+            train_outputs , train_loss = self.train_one_epoch(train_loader)
             history["train_loss"].append(train_loss)
  
             if val_loader is not None:
-                val_loss = self.evaluate(val_loader)
+                val_outputs, val_loss = self.evaluate(val_loader)
                 history["val_loss"].append(val_loss)
-                print(f"epoch {epoch + 1}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+                print(f"epoch {epoch + 1}: train_loss={train_loss:.4f} |  val_loss={val_loss:.4f}")
  
                 if self.scheduler is not None:
                     self.scheduler.step(val_loss)
@@ -560,7 +560,7 @@ class TrainingEval:
             else:
                 print(f"epoch {epoch + 1}: train_loss={train_loss:.4f}  (no val_loader given)")
  
-        return history
+        return train_outputs,val_outputs, history
     
     
     def run_training(
