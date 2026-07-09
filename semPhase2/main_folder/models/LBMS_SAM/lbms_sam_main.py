@@ -244,7 +244,61 @@ class DataLoading():
         return splits
    
         
-        
+def show_mask(mask, ax, random_color=False, borders = True):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+    h, w = mask.shape[-2:]
+    mask = mask.astype(np.uint8)
+    mask_image =  mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    if borders:
+        import cv2
+        contours, _ = cv2.findContours(mask,cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE) 
+        # Try to smooth contours
+        contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
+        mask_image = cv2.drawContours(mask_image, contours, -1, (1, 1, 1, 0.5), thickness=2) 
+    ax.imshow(mask_image)       
+
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels==1]
+    neg_points = coords[labels==0]
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
+
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2)) 
+
+def show_masks_comp(image, lbms_mask, lbms_iou, sam_mask, sam_iou,
+                     point_coords=None, input_labels=None, borders=True):
+    """
+    Same 2-panel format as your original show_masks_comp, but:
+    - takes ONE resolved mask per model (not indexable lists) -- there's
+      nothing to index once best-mask selection has already happened
+    - titles with REAL IoU vs GT, not the model's self-reported score,
+      since that score is a trained proxy, not ground truth
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    axes[0].imshow(image)
+    show_mask(lbms_mask, axes[0], borders=borders)
+    axes[0].set_title(f"Our Model — IoU: {lbms_iou:.3f}", fontsize=16)
+    axes[0].axis('off')
+
+    axes[1].imshow(image)
+    show_mask(sam_mask, axes[1], borders=borders)
+    axes[1].set_title(f"Original SAM2 — IoU: {sam_iou:.3f}", fontsize=16)
+    axes[1].axis('off')
+
+    if point_coords is not None:
+        assert input_labels is not None
+        show_points(point_coords, input_labels, axes[0])
+        show_points(point_coords, input_labels, axes[1])
+
+    plt.tight_layout()
+    plt.show()
 
 def sample_point_prompt(mask: np.ndarray) -> tuple[int, int]:
     """Point deepest inside the mask -- more robust than a random foreground pixel."""
@@ -252,6 +306,232 @@ def sample_point_prompt(mask: np.ndarray) -> tuple[int, int]:
     y, x = np.unravel_index(np.argmax(dist), dist.shape)
     return int(x), int(y)
 
+
+def compute_iou(pred_binary: torch.Tensor, gt_mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    pred_binary, gt_mask: (B, 1, H, W) tensors. Returns (B, 1) IoU per sample.
+
+    Standalone twin of TrainingEval.compute_iou -- doesn't touch self, so it's
+    pulled out here rather than requiring a TrainingEval instance just to
+    score two masks. TrainingEval.compute_iou is untouched; both do the
+    identical computation. Worth collapsing into one shared implementation
+    later, not done here to avoid touching a class you didn't ask me to
+    modify.
+    """
+    pred_binary = pred_binary.float()
+    gt_mask = gt_mask.float()
+    intersection = (pred_binary * gt_mask).sum(dim=(2, 3))
+    union = (pred_binary + gt_mask - pred_binary * gt_mask).sum(dim=(2, 3))
+    return intersection / (union + eps)
+
+
+def evaluate_on_ann_file(
+    lbms_sam,                 # LBMSSAM2Integration instance -- call lbms_sam.set_image(image) BEFORE this
+    image: np.ndarray,        # RGB array, the SAME image already passed to lbms_sam.set_image()
+    ann_path: str,             # path to the individual Supervisely-format json for this image
+    max_instances: int = 5,
+    plot: bool = True,
+):
+    """
+    Reads one Supervisely ann json, decodes every bitmap instance at the
+    image's native resolution, and for each instance:
+      - samples a point prompt from the GT mask (sample_point_prompt --
+        distance-transform peak, same convention used everywhere else)
+      - calls lbms_sam.forward(prompts=...) ONCE. This already runs both the
+        frozen SAM2 branch and the LBMS adapter branch internally and returns
+        both sets of masks/scores (see cells 16/49) -- no separate
+        predictor.predict() call needed, that just recomputes the same SAM2
+        branch a second time on the same image/point.
+      - scores both against GT with REAL IoU, not either model's
+        self-reported score (SAM2's iou_pred / LBMS's stability score are
+        both proxies, not ground truth)
+
+    Masks come back at the image's native H, W (SAM2Transforms upsamples
+    internally) -- no target_size padding to undo here. That padding only
+    exists in forward_train()'s batched TRAINING path (LBMSCocoDataset);
+    this function uses the inference path instead, which is the correct one
+    for held-out eval since it's the actual code path the product runs.
+    """
+    with open(ann_path) as f:
+        ann = json.load(f)
+    canvas_size = (ann["size"]["height"], ann["size"]["width"])
+    assert image.shape[:2] == canvas_size, (
+        f"image size {image.shape[:2]} != ann size {canvas_size} -- wrong image/ann pair?"
+    )
+
+    bitmap_objs = [o for o in ann.get("objects", []) if o.get("geometryType") == "bitmap"]
+    if not bitmap_objs:
+        print(f"No bitmap instances in {ann_path}, skipping.")
+        return []
+    if len(bitmap_objs) > max_instances:
+        print(f"{len(bitmap_objs)} instances found, evaluating first {max_instances}")
+    bitmap_objs = bitmap_objs[:max_instances]
+
+    results = []
+
+    for i, obj in enumerate(bitmap_objs):
+        gt_mask = DataLoading.decode_supervisely_bitmap(
+            obj["bitmap"]["data"], obj["bitmap"]["origin"], canvas_size
+        ).astype(np.uint8)
+
+        if not gt_mask.any():
+            print(f"Warning: empty GT mask for instance {i} in {ann_path}, skipping.")
+            continue
+
+        px, py = sample_point_prompt(gt_mask)
+        input_point = np.array([[px, py]])
+        input_label = np.array([1])
+
+        (sam_masks, sam_scores, sam_logits, sam_mask_feats, mask_channels,
+         lbms_masks, lbms_scores) = lbms_sam.forward(
+            prompts={
+                "point_coords": input_point,
+                "point_labels": input_label,
+                "multimask_output": True,
+            }
+        )
+
+        sam_sel = int(np.argmax(sam_scores))
+        lbms_sel = int(np.argmax(lbms_scores))
+        sam_mask = sam_masks[sam_sel].astype(np.uint8)
+        lbms_mask = lbms_masks[lbms_sel].astype(np.uint8)
+
+        gt_t = torch.from_numpy(gt_mask).float().unsqueeze(0).unsqueeze(0)
+        sam_iou = compute_iou(
+            torch.from_numpy(sam_mask).float().unsqueeze(0).unsqueeze(0), gt_t
+        ).item()
+        lbms_iou = compute_iou(
+            torch.from_numpy(lbms_mask).float().unsqueeze(0).unsqueeze(0), gt_t
+        ).item()
+
+        results.append({
+            "instance": i,
+            "lbms_real_iou": lbms_iou, "lbms_model_score": float(lbms_scores[lbms_sel]),
+            "sam_real_iou": sam_iou, "sam_model_score": float(sam_scores[sam_sel]),
+        })
+
+        if plot:
+            show_masks_comp(
+                image=image,
+                lbms_mask=lbms_mask, lbms_iou=lbms_iou,
+                sam_mask=sam_mask, sam_iou=sam_iou,
+                point_coords=input_point, input_labels=input_label,
+                borders=True,
+            )
+
+    return results
+
+def rank_masks_by_iou(
+    lbms_sam,
+    image: np.ndarray,        # RGB array, the SAME image already passed to lbms_sam.set_image()
+    ann_path: str,              # individual Supervisely-format json for this image
+    input_point: np.ndarray,    # shape (1, 2), e.g. np.array([[600, 480]])
+    input_label: Optional[np.ndarray] = None,   # defaults to a single positive point [1]
+    model: str = "both",        # "lbms", "sam2", or "both"
+    plot: bool = True,
+):
+    """
+    For a point YOU pick, ranks each requested model's 3 mask candidates
+    (multimask_output=True always returns 3) by REAL IoU against the
+    ground-truth instance under that point -- not by the model's own
+    self-reported score. There is no IoU without a GT mask to compare
+    against, so this needs ann_path and finds the GT instance itself via a
+    point-in-mask lookup; it does not accept an externally-supplied mask.
+
+    If the point falls inside more than one GT instance (touching/
+    overlapping particles are common in dense SEM images), the
+    smallest-area match is used as the intended target, and a warning is
+    printed -- silently guessing without flagging it would make the IoU
+    numbers depend on an assumption you can't see.
+
+    Scope: single positive point only. Negative points or multi-point
+    prompts aren't handled -- a negative point excludes an area rather than
+    identifying a target instance, so the point-in-mask GT lookup this
+    function relies on doesn't apply to it.
+    """
+    assert model in ("lbms", "sam2", "both"), f"model must be 'lbms', 'sam2', or 'both', got {model!r}"
+    if input_label is None:
+        input_label = np.array([1])
+
+    with open(ann_path) as f:
+        ann = json.load(f)
+    canvas_size = (ann["size"]["height"], ann["size"]["width"])
+    h, w = canvas_size
+    assert image.shape[:2] == canvas_size, (
+        f"image size {image.shape[:2]} != ann size {canvas_size} -- wrong image/ann pair?"
+    )
+
+    px, py = int(input_point[0][0]), int(input_point[0][1])
+    if not (0 <= px < w and 0 <= py < h):
+        raise ValueError(f"point ({px}, {py}) is outside image bounds ({w}x{h})")
+
+    matches = []
+    for obj in ann.get("objects", []):
+        if obj.get("geometryType") != "bitmap":
+            continue
+        mask = DataLoading.decode_supervisely_bitmap(
+            obj["bitmap"]["data"], obj["bitmap"]["origin"], canvas_size
+        )
+        if mask[py, px]:
+            matches.append((int(mask.sum()), mask))
+
+    if not matches:
+        raise ValueError(
+            f"No GT instance contains point ({px}, {py}) -- pick a point "
+            f"inside a labeled object; there's nothing to compute IoU against otherwise."
+        )
+    if len(matches) > 1:
+        print(f"Warning: point ({px}, {py}) falls inside {len(matches)} overlapping "
+              f"GT instances; using the smallest-area one as the intended target.")
+    matches.sort(key=lambda m: m[0])
+    gt_mask = matches[0][1].astype(np.uint8)
+    gt_t = torch.from_numpy(gt_mask).float().unsqueeze(0).unsqueeze(0)
+
+    (sam_masks, sam_scores, sam_logits, sam_mask_feats, mask_channels,
+     lbms_masks, lbms_scores) = lbms_sam.forward(
+        prompts={
+            "point_coords": input_point,
+            "point_labels": input_label,
+            "multimask_output": True,
+        }
+    )
+
+    def rank(masks, scores):
+        ranked = []
+        for idx in range(len(masks)):
+            m = masks[idx].astype(np.uint8)
+            iou = compute_iou(
+                torch.from_numpy(m).float().unsqueeze(0).unsqueeze(0), gt_t
+            ).item()
+            ranked.append({"mask": m, "iou": iou, "model_score": float(scores[idx])})
+        ranked.sort(key=lambda r: r["iou"], reverse=True)
+        return ranked
+
+    output = {}
+    if model in ("lbms", "both"):
+        output["lbms"] = rank(lbms_masks, lbms_scores)
+    if model in ("sam2", "both"):
+        output["sam2"] = rank(sam_masks, sam_scores)
+
+    if plot:
+        for name, ranked in output.items():
+            label = "Our Model" if name == "lbms" else "Original SAM2"
+            fig, axes = plt.subplots(1, len(ranked), figsize=(8 * len(ranked), 8))
+            if len(ranked) == 1:
+                axes = [axes]
+            for rank_idx, r in enumerate(ranked):
+                axes[rank_idx].imshow(image)
+                show_mask(r["mask"], axes[rank_idx], borders=True)
+                show_points(input_point, input_label, axes[rank_idx])
+                axes[rank_idx].set_title(
+                    f"{label} — rank {rank_idx + 1} — IoU: {r['iou']:.3f} "
+                    f"(self-score: {r['model_score']:.3f})", fontsize=14
+                )
+                axes[rank_idx].axis('off')
+            plt.tight_layout()
+            plt.show()
+
+    return output
 
 class LBMSCocoDataset(Dataset):
     def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024, 
@@ -465,6 +745,38 @@ class TrainingEval:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
         self.model.eval()
         running_loss = 0.0
+        outputs_list = {}
+        for step , batch in enumerate(loader):
+            images = batch["image"].to(self.device)
+            point_coords = batch["point_coords"].to(self.device)
+            point_labels = batch["point_labels"].to(self.device)
+            gt_masks = batch["gt_mask"].to(self.device)
+            material_class = batch["material_class"]
+            if torch.is_tensor(material_class):
+                material_class = material_class.to(self.device)
+
+            outputs = self.model.forward_train(
+                images=images,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+            outputs_list[step] = outputs
+            loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
+            running_loss += loss.item()
+
+            if test:
+                if step%10 == 0:
+                    print(f'Batch: {step+1} / {len(loader)}')
+                
+
+        return outputs_list, running_loss / max(len(loader), 1)
+    
+    def inference_from_eval(self, loader: DataLoader, test=False) -> float:
+        """Runs val/test in eval mode with grad disabled. Returns average loss."""
+        self.model.eval()
+        running_loss = 0.0
+        outputs_list = {}
         for step , batch in enumerate(loader):
             images = batch["image"].to(self.device)
             point_coords = batch["point_coords"].to(self.device)
@@ -485,10 +797,11 @@ class TrainingEval:
 
             if test:
                 if step%10 == 0:
+                    outputs_list[batch['image']] = outputs
                     print(f'Batch: {step+1} / {len(loader)}')
                 
 
-        return outputs, running_loss / max(len(loader), 1)
+        return outputs_list, running_loss / max(len(loader), 1)
     
 
     def eval_one(self, image):
@@ -602,7 +915,7 @@ class TrainingEval:
         )
  
 
-class Testing:
+
     def __init__(self,
                  model,
                  loss_fn : Optional[Callable] = None,
