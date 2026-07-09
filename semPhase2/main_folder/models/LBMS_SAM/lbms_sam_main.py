@@ -483,7 +483,10 @@ class TrainingEval:
             loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
             running_loss += loss.item()
 
-                    
+            if test:
+                if step%10 == 0:
+                    print(f'Batch: {step+1} / {len(loader)}')
+                
 
         return outputs, running_loss / max(len(loader), 1)
     
