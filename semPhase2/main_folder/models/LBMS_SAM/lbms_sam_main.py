@@ -534,6 +534,10 @@ def rank_masks_by_iou(
 
     return output
 
+
+        
+
+
 class LBMSCocoDataset(Dataset):
     def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024, 
                  max_samples: Optional[int] = None):
@@ -739,6 +743,7 @@ class TrainingEval:
         self.model.eval()
         running_loss = 0.0
         outputs_list = {}
+        
         for step , batch in enumerate(loader):
             images = batch["image"].to(self.device)
             point_coords = batch["point_coords"].to(self.device)
@@ -765,6 +770,54 @@ class TrainingEval:
 
         return outputs_list, running_loss / max(len(loader), 1)
     
+    @torch.no_grad()
+    def benchmark_both(self, loader: DataLoader):
+        """
+        Full-loader benchmark: mean training loss (self.loss_fn) and mean
+        best-of-3 IoU (SAM's own eval convention) against ground truth.
+        NOTE: despite the name, this only evaluates self.model — it does not
+        run a separate baseline SAM2 for comparison. Rename or extend if you
+        actually want the two-model comparison.
+        """
+        self.model.eval()
+        running_loss = 0.0
+        all_ious = []
+
+        for batch in loader:
+            images = batch["image"].to(self.device)
+            point_coords = batch["point_coords"].to(self.device)
+            point_labels = batch["point_labels"].to(self.device)
+            gt_masks = batch["gt_mask"].to(self.device)
+            material_class = batch["material_class"]
+            if torch.is_tensor(material_class):
+                material_class = material_class.to(self.device)
+
+            if gt_masks.dim() == 3:
+                gt_masks = gt_masks.unsqueeze(1)          # (B,H,W) -> (B,1,H,W)
+            elif gt_masks.dim() != 4 or gt_masks.shape[1] != 1:
+                raise ValueError(f"expected gt_mask shaped (B,H,W) or (B,1,H,W), got {tuple(gt_masks.shape)}")
+
+            outputs = self.model.forward_train(
+                images=images,
+                point_coords=point_coords,
+                point_labels=point_labels,
+                multimask_output=True,
+            )
+
+            loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
+            running_loss += loss.item()
+
+            pred_masks = outputs.masks                                   # (B, num_masks, H, W)
+            pred_binary = (torch.sigmoid(pred_masks) > 0.5).float()
+            gt_expanded = gt_masks.expand(-1, pred_masks.shape[1], -1, -1)
+            ious = self.compute_iou(pred_binary, gt_expanded)             # (B, num_masks)
+            best_iou, _ = ious.max(dim=1)                                  # (B,) best-of-3
+            all_ious.append(best_iou)
+
+        mean_iou = torch.cat(all_ious).mean().item()
+        mean_loss = running_loss / max(len(loader), 1)
+        return mean_iou, mean_loss
+
     def inference_from_eval(self, loader: DataLoader, test=False) -> float:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
         self.model.eval()
@@ -807,6 +860,7 @@ class TrainingEval:
         plt.axis('on')
         plt.show
     
+
     def save_trainable_state(self, path: str) -> None:
         """
         Saves only params with requires_grad=True (your adapter weights --
