@@ -544,23 +544,31 @@ class LBMSCocoDataset(Dataset):
         self.coco = COCO(coco_json_path)
         self.image_dir = image_dir
         self.img_ids = list(self.coco.imgs.keys())
+        self.deterministic = True
 
         if max_samples is not None:
             self.img_ids = self.img_ids[:max_samples]
 
         self.target_size = target_size
+
         
 
     def __len__(self):
         return len(self.img_ids)
 
     def __getitem__(self, idx):
+
         img_id = self.img_ids[idx]
         img_info = self.coco.imgs[img_id]
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         anns = self.coco.loadAnns(ann_ids)
         if not anns:
             raise ValueError(f"Image {img_id} ({img_info['file_name']}) has zero instances")
+
+        if self.deterministic:
+            ann = anns[random.Random(img_id).randrange(len(anns))]   # stable across passes/epochs
+        else:
+            ann = anns[np.random.randint(len(anns))]
 
         image = cv2.imread(f"{self.image_dir}/{img_info['file_name']}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -772,6 +780,7 @@ class TrainingEval:
     
     @torch.no_grad()
     def benchmark_both(self, loader: DataLoader):
+
         """
         Full-loader benchmark: mean training loss (self.loss_fn) and mean
         best-of-3 IoU (SAM's own eval convention) against ground truth.
@@ -783,7 +792,7 @@ class TrainingEval:
         running_loss = 0.0
         all_ious = []
 
-        for batch in loader:
+        for step, batch in enumerate(loader):
             images = batch["image"].to(self.device)
             point_coords = batch["point_coords"].to(self.device)
             point_labels = batch["point_labels"].to(self.device)
@@ -814,9 +823,69 @@ class TrainingEval:
             best_iou, _ = ious.max(dim=1)                                  # (B,) best-of-3
             all_ious.append(best_iou)
 
+            if step%10 == 1:
+                    print(f'Batch: {step} / {len(loader)}')
+
         mean_iou = torch.cat(all_ious).mean().item()
         mean_loss = running_loss / max(len(loader), 1)
-        return mean_iou, mean_loss
+        return mean_iou, mean_loss, all_ious
+
+
+
+
+    def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_image: Optional[int] = None):
+        """
+        Correct dataset-scale LBMS-SAM vs frozen-SAM2 comparison. Pairing is
+        guaranteed because lbms_sam.forward() returns both models' masks from
+        a single call on the same image/point -- no separate loader passes,
+        no risk of index misalignment.
+        """
+        ann_file = os.path.join(coco_root_dir, "annotations.json")
+        img_dir = os.path.join(coco_root_dir, "img")
+        coco = COCO(ann_file)
+
+        lbms_ious, sam_ious = [], []
+
+        for img_id in coco.imgs:
+            img_info = coco.imgs[img_id]
+            image = cv2.imread(os.path.join(img_dir, img_info["file_name"]))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            lbms_sam.set_image(image)   # once per image, required before forward()
+
+            anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+            if max_instances_per_image is not None:
+                anns = anns[:max_instances_per_image]
+
+            for ann in anns:
+                gt_mask = mask_utils.decode(ann["segmentation"]).astype(np.uint8)
+                if not gt_mask.any():
+                    continue
+
+                px, py = sample_point_prompt(gt_mask)
+                input_point = np.array([[px, py]])
+                input_label = np.array([1])
+
+                (sam_masks, sam_scores, sam_logits, sam_mask_feats, mask_channels,
+                lbms_masks, lbms_scores) = lbms_sam.forward(
+                    prompts={"point_coords": input_point, "point_labels": input_label,
+                            "multimask_output": True}
+                )
+
+                sam_sel = int(np.argmax(sam_scores))
+                lbms_sel = int(np.argmax(lbms_scores))
+                gt_t = torch.from_numpy(gt_mask).float().unsqueeze(0).unsqueeze(0)
+
+                sam_iou = compute_iou(torch.from_numpy(sam_masks[sam_sel].astype(np.uint8))
+                                    .float().unsqueeze(0).unsqueeze(0), gt_t).item()
+                lbms_iou = compute_iou(torch.from_numpy(lbms_masks[lbms_sel].astype(np.uint8))
+                                        .float().unsqueeze(0).unsqueeze(0), gt_t).item()
+
+                lbms_ious.append(lbms_iou)
+                sam_ious.append(sam_iou)
+
+        return np.array(lbms_ious), np.array(sam_ious)
+
+
 
     def inference_from_eval(self, loader: DataLoader, test=False) -> float:
         """Runs val/test in eval mode with grad disabled. Returns average loss."""
@@ -922,7 +991,7 @@ class TrainingEval:
                     print(f"  -> new best val_loss, saved adapter weights to {checkpoint_path}")
             else:
                 print(f"epoch {epoch + 1}: train_loss={train_loss:.4f}  (no val_loader given)")
- 
+
         return train_outputs,val_outputs, history
     
     
