@@ -34,6 +34,8 @@ env/
 *.ckpt
 *.onnx
 
+/Users/tjsss/Desktop/bharatAtomic/runs
+
 # =========================
 # Datasets & archives
 # =========================
@@ -44,6 +46,7 @@ env/
 *.jpeg
 *.png
 *.tar
+*.json
 
 dataset/
 datasets/

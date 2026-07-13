@@ -11,3 +11,6 @@ DISTS-pytorch
 omegaconf
 hydra-core
 patchify
+pycocotools
+monai
+ultralytics
