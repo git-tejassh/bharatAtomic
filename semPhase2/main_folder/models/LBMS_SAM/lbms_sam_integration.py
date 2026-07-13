@@ -3,6 +3,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2
+import numpy as np
 
 from lbms_sam_base import GSEFE , MDFF, FeatureFusion
 from SAM.modeling.sam2_base import SAM2Base
@@ -44,6 +46,7 @@ class LBMSSAM2Integration(nn.Module):
         iou_prediction_use_sigmoid=False,
         transformer_dim: int = 256,
         num_multimask_outputs: int = 3,
+        target_size: int = 1024, 
         ):
         
         
@@ -52,6 +55,7 @@ class LBMSSAM2Integration(nn.Module):
         self.token_dim = token_dim
         self.mask_feat_channels = mask_feat_channels
         self.num_multimask_outputs = num_multimask_outputs
+        self.target_size = target_size  
         self.num_mask_tokens = num_multimask_outputs + 1  # +1 for the single-mask token
 
 
@@ -92,15 +96,32 @@ class LBMSSAM2Integration(nn.Module):
 
         self.image_encoder = self.sam2.model.image_encoder
 
+    def _preprocess_gsefe_input(self, image_np):
+        """
+        Replicate LBMSCocoDataset.__getitem__'s IMAGE preprocessing exactly so
+        GSEFE sees the same spatial frame at inference as in training: resize
+        the longest side to target_size, pad to a target_size square, scale to
+        [0,1], move to device. NOT SAM-normalized -- GSEFE consumes raw [0,1],
+        matching forward_train's `images`. Fixes both the frame mismatch and
+        the device bug in one place.
+        """
+        orig_h, orig_w = image_np.shape[:2]
+        scale = self.target_size / max(orig_h, orig_w)
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        resized = cv2.resize(image_np, (new_w, new_h))  # cv2 takes (W, H)
+        padded = np.zeros((self.target_size, self.target_size, 3), dtype=np.uint8)
+        padded[:new_h, :new_w] = resized
+        return (
+            torch.from_numpy(padded).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        ).to(self.sam2.device)
+    
     def set_image(self, image):
         """
         image: HWC numpy array (uint8 or float), NOT a tensor.
         Call this once before forward(); forward() no longer calls it itself.
         """
         self.image = image
-        self.image_tensor = (
-            torch.from_numpy(self.image).permute(2, 0, 1).unsqueeze(0).float()/ 255.0
-            )
+        self.image_tensor = self._preprocess_gsefe_input(image)
         self.sam2.set_image(image)
 
         # cache trunk outputs here --
@@ -123,18 +144,18 @@ class LBMSSAM2Integration(nn.Module):
             self.sam2.predict(**prompts,)
         )
 
-        print("Mask_Channels from SAM2.predict function: ", mask_channels)
-        print("Mask Features from SAM2.predict function: ", mask_feats.shape)
+        # print("Mask_Channels from SAM2.predict function: ", mask_channels)
+        # print("Mask Features from SAM2.predict function: ", mask_feats.shape)
         self.mask_channels = mask_channels
         return sam_masks, scores, logits, mask_feats , mask_channels, output_tokens
     
     
-    def _get_stability_scores(self, mask_logits: torch.Tensor):
-        mask_logits = mask_logits.flatten(-2)
-        stability_delta = self.dynamic_multimask_stability_delta  # typically 1.0
-        area_i = torch.sum(mask_logits > stability_delta, dim=-1).float()
-        area_u = torch.sum(mask_logits > -stability_delta, dim=-1).float()
-        return torch.where(area_u > 0, area_i / area_u, 1.0)
+    # def _get_stability_scores(self, mask_logits: torch.Tensor):
+    #     mask_logits = mask_logits.flatten(-2)
+    #     stability_delta = self.dynamic_multimask_stability_delta  # typically 1.0
+    #     area_i = torch.sum(mask_logits > stability_delta, dim=-1).float()
+    #     area_u = torch.sum(mask_logits > -stability_delta, dim=-1).float()
+    #     return torch.where(area_u > 0, area_i / area_u, 1.0)
     
 
     def _fuse_lbms_masks(self, mask_feats, mdff_output, gsefe_output, output_tokens, multimask_output):
