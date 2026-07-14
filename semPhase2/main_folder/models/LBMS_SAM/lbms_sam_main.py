@@ -533,10 +533,7 @@ def rank_masks_by_iou(
             plt.show()
 
     return output
-
-
         
-
 
 class LBMSCocoDataset(Dataset):
     def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024, 
@@ -652,7 +649,7 @@ class TrainingEval:
         self.scheduler = None
         if self.optimizer is not None:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-8
+                self.optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-9
             )
  
     def train_one_epoch(self, loader: DataLoader) -> float:

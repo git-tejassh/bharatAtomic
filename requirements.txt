@@ -14,3 +14,4 @@ patchify
 pycocotools
 monai
 ultralytics
+scikit-learn

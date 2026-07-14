@@ -34,7 +34,7 @@ env/
 *.ckpt
 *.onnx
 
-/Users/tjsss/Desktop/bharatAtomic/runs
+
 
 # =========================
 # Datasets & archives
@@ -54,6 +54,7 @@ data/
 papers/
 masked_dataset/
 PerovSegNet-Dataset/
+
 
 # =========================
 # Experiment outputs
@@ -87,6 +88,10 @@ semPhase2/main_folder/models/LBMS_SAM/sam2
 semPhase2/main_folder/models/LBMS_SAM/sam2/
 semPhase2/main_folder/emps_dataset/
 semPhase2/main_folder/models/yolo/YOLO_gitRepo
+
+
+runs/segment/
+
 
 # Claude
 .claude/
