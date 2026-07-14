@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import time
 from PIL.Image import Image
 
 from modeling.sam2_base import SAM2Base
@@ -288,6 +289,7 @@ class SAM2ImagePredictor:
             point_coords, point_labels, box, mask_input, normalize_coords
         )
 
+        start_time = time.time()
         masks, iou_predictions, low_res_masks, to_fuse_from_sam, mask_channels, output_tokens = self._predict(
             unnorm_coords,
             labels,
@@ -298,9 +300,14 @@ class SAM2ImagePredictor:
         )
 
 
+
         masks_np = masks.squeeze(0).float().detach().cpu().numpy()
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
+
+        prediction_time = time.time() - start_time
+        print(f'Inference Time: {prediction_time}')
+        
         return masks_np, iou_predictions_np, low_res_masks_np, to_fuse_from_sam, mask_channels, output_tokens
 
     def _prep_prompts(
