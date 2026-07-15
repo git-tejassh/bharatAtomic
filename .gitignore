@@ -20,6 +20,7 @@ venv/
 env/
 .venv/
 .env
+bA_rfdetr/
 
 # =========================
 # Jupyter
@@ -54,7 +55,8 @@ data/
 papers/
 masked_dataset/
 PerovSegNet-Dataset/
-
+main_folder/models/rf-detr/COCO_format
+main_folder/models/rf-detr/ckpts
 
 # =========================
 # Experiment outputs
@@ -72,6 +74,8 @@ semPhase1/notebooks/images/
 semPhase1/notebooks/pix2pix/
 semPhase1/pix2pix/
 semPhase2/PerovSegNet-Dataset
+semPhase2/main_folder/models/rf-detr/COCO_format
+semPhase2/main_folder/models/rf-detr/ckpts
 
 # External repositories
 semPhase1/NAFNet_github_megvii/
