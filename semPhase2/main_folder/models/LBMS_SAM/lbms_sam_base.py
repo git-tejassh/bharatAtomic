@@ -204,9 +204,19 @@ class SoftThreshold(nn.Module):
     diagram shows a SINGLE shared DWT->...->IDWT path, not 4 independent ones.
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, init_threshold: float = 0.05):
         super().__init__()
-        self.threshold = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        raw_init = math.log(math.expm1(init_threshold))
+        
+        # FIX: old init was torch.zeros -> softplus(0) ≈ 0.693 on every
+        # channel at start. HH (and most LH/HL) coefficient magnitudes from
+        # Hiera trunk features never exceeded that, so relu(|x|-t)=0
+        # everywhere -> zero gradient -> permanently dead (confirmed: HH
+        # 32/32 channels dead, LH/HL ~24/32 dead in the checkpoint diff).
+        # Invert softplus so the starting threshold is small and reachable,
+        # instead of guessing zero and hoping.
+
+        self.threshold = nn.Parameter(torch.full((1, channels, 1, 1), raw_init))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = F.softplus(self.threshold)

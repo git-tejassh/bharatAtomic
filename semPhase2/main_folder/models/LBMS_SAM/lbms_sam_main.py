@@ -15,6 +15,7 @@ import base64
 import cv2
 import zlib
 import torch
+from PIL import Image
 import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
@@ -537,11 +538,11 @@ def rank_masks_by_iou(
 
 class LBMSCocoDataset(Dataset):
     def __init__(self, coco_json_path: str, image_dir: str, target_size: int = 1024, 
-                 max_samples: Optional[int] = None):
+                 max_samples: Optional[int] = None, deterministic: bool = True,):
         self.coco = COCO(coco_json_path)
         self.image_dir = image_dir
         self.img_ids = list(self.coco.imgs.keys())
-        self.deterministic = True
+        self.deterministic = deterministic
 
         if max_samples is not None:
             self.img_ids = self.img_ids[:max_samples]
@@ -571,7 +572,14 @@ class LBMSCocoDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = image.shape[:2]
 
-        ann = anns[np.random.randint(len(anns))]
+        # FIX: removed the unconditional `ann = anns[np.random.randint(len(anns))]`
+        # that used to sit right here -- it silently overwrote the line
+        # above on every call, so self.deterministic never did anything.
+        # Every __getitem__ picked a fresh random instance, including on
+        # val_loader, contradicting the docstring's "stable across
+        # passes/epochs" promise. This is a strong candidate for the
+        # val-loss spikes seen in the training curve a few turns back.
+
         assert list(ann["segmentation"]["size"]) == [orig_h, orig_w], (
             f"RLE size {ann['segmentation']['size']} != image size {(orig_h, orig_w)} "
             f"for {img_info['file_name']} -- stale annotation or wrong image file"
@@ -610,6 +618,7 @@ def build_dataloader(
     batch_size: int = 4,
     shuffle: bool = True,
     num_workers: int = 0,
+    deterministic: bool = True,
 ) -> DataLoader:
     """
     coco_root_dir is a split folder like COCO_format/train_dir, expected to contain:
@@ -623,6 +632,8 @@ def build_dataloader(
         coco_json_path=ann_file,
         image_dir=image_dir,
         target_size=target_size,
+        max_samples=max_samples,
+        deterministic = deterministic,
     )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
  
@@ -738,8 +749,8 @@ class TrainingEval:
         best_actual_iou = ious[batch_idx, best_idx].unsqueeze(1)       # (B,1)
  
         mask_loss = self.mask_loss_fn(best_mask, gt)
-        iou_loss = F.mse_loss(best_iou_pred, best_actual_iou)
-        return mask_loss + iou_loss
+        # iou_loss = F.mse_loss(best_iou_pred, best_actual_iou)
+        return self.mask_loss_fn(best_mask, gt)
  
  
     @torch.no_grad()
@@ -830,101 +841,52 @@ class TrainingEval:
 
 
 
-    def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_image: Optional[int] = None):
-        """
-        Correct dataset-scale LBMS-SAM vs frozen-SAM2 comparison. Pairing is
-        guaranteed because lbms_sam.forward() returns both models' masks from
-        a single call on the same image/point -- no separate loader passes,
-        no risk of index misalignment.
-        """
-        ann_file = os.path.join(coco_root_dir, "annotations.json")
-        img_dir = os.path.join(coco_root_dir, "img")
-        coco = COCO(ann_file)
 
-        lbms_ious, sam_ious = [], []
+    # def inference_from_eval(self, loader: DataLoader, test=False) -> float:
+    #     """Runs val/test in eval mode with grad disabled. Returns average loss."""
+    #     self.model.eval()
+    #     running_loss = 0.0
+    #     outputs_list = {}
+    #     for step , batch in enumerate(loader):
+    #         images = batch["image"].to(self.device)
+    #         point_coords = batch["point_coords"].to(self.device)
+    #         point_labels = batch["point_labels"].to(self.device)
+    #         gt_masks = batch["gt_mask"].to(self.device)
+    #         material_class = batch["material_class"]
+    #         if torch.is_tensor(material_class):
+    #             material_class = material_class.to(self.device)
 
-        for img_id in coco.imgs:
-            img_info = coco.imgs[img_id]
-            image = cv2.imread(os.path.join(img_dir, img_info["file_name"]))
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            lbms_sam.set_image(image)   # once per image, required before forward()
+    #         outputs = self.model.forward_train(
+    #             images=images,
+    #             point_coords=point_coords,
+    #             point_labels=point_labels,
+    #             multimask_output=True,
+    #         )
+    #         loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
+    #         running_loss += loss.item()
 
-            anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
-            if max_instances_per_image is not None:
-                anns = anns[:max_instances_per_image]
-
-            for ann in anns:
-                gt_mask = mask_utils.decode(ann["segmentation"]).astype(np.uint8)
-                if not gt_mask.any():
-                    continue
-
-                px, py = sample_point_prompt(gt_mask)
-                input_point = np.array([[px, py]])
-                input_label = np.array([1])
-
-                (sam_masks, sam_scores, sam_logits, sam_mask_feats, mask_channels,
-                lbms_masks, lbms_scores) = lbms_sam.forward(
-                    prompts={"point_coords": input_point, "point_labels": input_label,
-                            "multimask_output": True}
-                )
-
-                sam_sel = int(np.argmax(sam_scores))
-                lbms_sel = int(np.argmax(lbms_scores))
-                gt_t = torch.from_numpy(gt_mask).float().unsqueeze(0).unsqueeze(0)
-
-                sam_iou = compute_iou(torch.from_numpy(sam_masks[sam_sel].astype(np.uint8))
-                                    .float().unsqueeze(0).unsqueeze(0), gt_t).item()
-                lbms_iou = compute_iou(torch.from_numpy(lbms_masks[lbms_sel].astype(np.uint8))
-                                        .float().unsqueeze(0).unsqueeze(0), gt_t).item()
-
-                lbms_ious.append(lbms_iou)
-                sam_ious.append(sam_iou)
-
-        return np.array(lbms_ious), np.array(sam_ious)
-
-
-
-    def inference_from_eval(self, loader: DataLoader, test=False) -> float:
-        """Runs val/test in eval mode with grad disabled. Returns average loss."""
-        self.model.eval()
-        running_loss = 0.0
-        outputs_list = {}
-        for step , batch in enumerate(loader):
-            images = batch["image"].to(self.device)
-            point_coords = batch["point_coords"].to(self.device)
-            point_labels = batch["point_labels"].to(self.device)
-            gt_masks = batch["gt_mask"].to(self.device)
-            material_class = batch["material_class"]
-            if torch.is_tensor(material_class):
-                material_class = material_class.to(self.device)
-
-            outputs = self.model.forward_train(
-                images=images,
-                point_coords=point_coords,
-                point_labels=point_labels,
-                multimask_output=True,
-            )
-            loss = self.loss_fn(outputs, {"gt_mask": gt_masks, "material_class": material_class})
-            running_loss += loss.item()
-
-            if test:
-                if step%10 == 0:
-                    outputs_list[batch['image']] = outputs
-                    print(f'Batch: {step+1} / {len(loader)}')
+    #         if test:
+    #             if step%10 == 0:
+    #                 outputs_list[batch['image']] = outputs
+    #                 print(f'Batch: {step+1} / {len(loader)}')
                 
 
-        return outputs_list, running_loss / max(len(loader), 1)
+    #     return outputs_list, running_loss / max(len(loader), 1)
     
 
-    def eval_one(self, image):
-        self.model.eval()
-        image = Image.open(image)
-        image = np.array(image.convert('RGB'))
-
-        plt.figure(figsize=(10,10))
-        plt.imshow(image) 
-        plt.axis('on')
-        plt.show
+    
+    # def eval_one(self, image):
+    """NOTE: currently only loads and displays the raw image -- it does not
+    run the model or draw a predicted mask, despite the name. Looks like an
+    unfinished stub; wire in an actual forward() + show_mask() call if this
+    is meant to visualize a prediction."""
+    #     self.model.eval()
+    #     image = Image.open(image)
+    #     image = np.array(image.convert('RGB'))
+    #     plt.figure(figsize=(10, 10))
+    #     plt.imshow(image)
+    #     plt.axis('on')
+    #     plt.show()  
     
 
     def save_trainable_state(self, path: str) -> None:
@@ -1026,4 +988,59 @@ class TrainingEval:
             num_epochs=num_epochs,
             checkpoint_path=checkpoint_path,
         )
+ 
+
+
+
+def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_image: Optional[int] = None):
+        """
+        Correct dataset-scale LBMS-SAM vs frozen-SAM2 comparison. Pairing is
+        guaranteed because lbms_sam.forward() returns both models' masks from
+        a single call on the same image/point -- no separate loader passes,
+        no risk of index misalignment.
+        """
+        ann_file = os.path.join(coco_root_dir, "annotations.json")
+        img_dir = os.path.join(coco_root_dir, "img")
+        coco = COCO(ann_file)
+
+        lbms_ious, sam_ious = [], []
+
+        for img_id in coco.imgs:
+            img_info = coco.imgs[img_id]
+            image = cv2.imread(os.path.join(img_dir, img_info["file_name"]))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            lbms_sam.set_image(image)   # once per image, required before forward()
+
+            anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+            if max_instances_per_image is not None:
+                anns = anns[:max_instances_per_image]
+
+            for ann in anns:
+                gt_mask = mask_utils.decode(ann["segmentation"]).astype(np.uint8)
+                if not gt_mask.any():
+                    continue
+
+                px, py = sample_point_prompt(gt_mask)
+                input_point = np.array([[px, py]])
+                input_label = np.array([1])
+
+                (sam_masks, sam_scores, sam_logits, sam_mask_feats, mask_channels,
+                lbms_masks, lbms_scores) = lbms_sam.forward(
+                    prompts={"point_coords": input_point, "point_labels": input_label,
+                            "multimask_output": True}
+                )
+
+                sam_sel = int(np.argmax(sam_scores))
+                lbms_sel = int(np.argmax(lbms_scores))
+                gt_t = torch.from_numpy(gt_mask).float().unsqueeze(0).unsqueeze(0)
+
+                sam_iou = compute_iou(torch.from_numpy(sam_masks[sam_sel].astype(np.uint8))
+                                    .float().unsqueeze(0).unsqueeze(0), gt_t).item()
+                lbms_iou = compute_iou(torch.from_numpy(lbms_masks[lbms_sel].astype(np.uint8))
+                                        .float().unsqueeze(0).unsqueeze(0), gt_t).item()
+
+                lbms_ious.append(lbms_iou)
+                sam_ious.append(sam_iou)
+
+        return np.array(lbms_ious), np.array(sam_ious)
  
