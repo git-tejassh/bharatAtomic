@@ -202,25 +202,75 @@ class SoftThreshold(nn.Module):
     coefficients, keep large/structural ones). One threshold parameter per
     channel, shared across all 4 GA branches' high-freq sub-bands since the
     diagram shows a SINGLE shared DWT->...->IDWT path, not 4 independent ones.
+    PARAMETERIZATION (post-mortem on the P1 mask-hole regression):
+    The original fix here replaced a dead `softplus(zeros_init)` (see git
+    history) with `softplus(inverse_softplus(0.05))`, which did make the
+    threshold path receive gradient -- but softplus is unbounded above, so a
+    single large gradient step (this module has only `channels` scalars, so
+    steps are poorly damped relative to a normal conv layer's parameter
+    count) can push the threshold arbitrarily high, suppressing real
+    high-frequency signal precisely on dense/spiky SEM texture. Post-100-epoch
+    checkpoint diffs showed exactly this: all 32 channels per sub-band
+    converging into a ~0.04-wide band, i.e. behaving like one shared scalar
+    instead of 32 differentiated thresholds.
+
+    Fix: bound the effective threshold to (0, max_threshold) via a scaled
+    sigmoid (the "tanh-scaled" reparameterization from the problem log --
+    sigmoid is used instead of tanh so the output is naturally non-negative
+    without an extra abs()). This caps how much damage one bad gradient step
+    can do, and keeps the raw parameter on a comparable scale to the rest of
+    the network, so it can share an optimizer/LR schedule sanely (pair with
+    a separate low-LR param group anyway -- see TrainingEval -- since this
+    is still a very low-dimensional parameter relative to a conv layer).
+
+    A small per-channel init jitter breaks the exact symmetry across
+    channels: with all 32 channels starting at bit-identical values and
+    seeing highly correlated gradients (they all read off the same summed
+    wavelet sub-band), they have little basis to diverge on their own. The
+    jitter is small enough not to change the intended starting threshold in
+    aggregate.
     """
 
-    def __init__(self, channels: int, init_threshold: float = 0.05):
+    def __init__(self, channels: int, init_threshold: float = 0.05, max_threshold: float = 0.5):
         super().__init__()
-        raw_init = math.log(math.expm1(init_threshold))
-        
-        # FIX: old init was torch.zeros -> softplus(0) ≈ 0.693 on every
-        # channel at start. HH (and most LH/HL) coefficient magnitudes from
-        # Hiera trunk features never exceeded that, so relu(|x|-t)=0
-        # everywhere -> zero gradient -> permanently dead (confirmed: HH
-        # 32/32 channels dead, LH/HL ~24/32 dead in the checkpoint diff).
-        # Invert softplus so the starting threshold is small and reachable,
-        # instead of guessing zero and hoping.
 
-        self.threshold = nn.Parameter(torch.full((1, channels, 1, 1), raw_init))
+        if not (0.0 < init_threshold < max_threshold):
+            raise ValueError(
+                f"init_threshold ({init_threshold}) must be in (0, max_threshold={max_threshold})"
+            )
+        self.max_threshold = max_threshold
+
+        # inverse sigmoid: solve max_threshold * sigmoid(raw) = init_threshold
+        p = init_threshold / max_threshold
+        raw_init = math.log(p / (1.0 - p))
+
+        init = torch.full((1, channels, 1, 1), raw_init)
+        init = init + torch.randn_like(init) * 0.01  # symmetry-breaking jitter
+        self.threshold = nn.Parameter(init)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = F.softplus(self.threshold)
+        t = self.max_threshold * torch.sigmoid(self.threshold)
         return torch.sign(x) * F.relu(torch.abs(x) - t)
+    
+
+    @torch.no_grad()
+    def threshold_diagnostics(self) -> dict:
+        """
+        Per-channel effective-threshold stats (post-sigmoid, the actual
+        values used in forward()). Confirms whether channels have
+        differentiated (std rising above the ~0.01 init jitter) or remain
+        collapsed into one effective global scalar -- P1's "Not yet done"
+        item 1.
+        """
+        t = (self.max_threshold * torch.sigmoid(self.threshold)).flatten()
+        return {
+            "mean": t.mean().item(),
+            "std": t.std().item(),
+            "min": t.min().item(),
+            "max": t.max().item(),
+        }
+
 
 
 class MDFF(nn.Module):
@@ -326,6 +376,15 @@ class MDFF(nn.Module):
             recon = recon[:, :, :h, :w]
 
         return self.post_processing(recon)
+    
+    @torch.no_grad()
+    def threshold_diagnostics(self) -> dict:
+        """Per-sub-band threshold_diagnostics() -- see SoftThreshold. P1 item 1."""
+        return {
+            "lh": self.denoise_lh.threshold_diagnostics(),
+            "hl": self.denoise_hl.threshold_diagnostics(),
+            "hh": self.denoise_hh.threshold_diagnostics(),
+        }
 
 
 # ---------------------------------------------------------------------------

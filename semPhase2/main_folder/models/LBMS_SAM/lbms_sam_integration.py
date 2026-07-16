@@ -46,7 +46,9 @@ class LBMSSAM2Integration(nn.Module):
         iou_prediction_use_sigmoid=False,
         transformer_dim: int = 256,
         num_multimask_outputs: int = 3,
-        target_size: int = 1024, 
+        target_size: int = 1024,
+        use_mdff: bool = True,
+        use_gsefe: bool = True,
         ):
         
         
@@ -57,6 +59,15 @@ class LBMSSAM2Integration(nn.Module):
         self.num_multimask_outputs = num_multimask_outputs
         self.target_size = target_size  
         self.num_mask_tokens = num_multimask_outputs + 1  # +1 for the single-mask token
+
+        # P1/P5 ablation switches: isolate which branch (if either) causes
+        # the mask-hole regression by zeroing its contribution to fusion.
+        # Both branches still run (so shapes/checkpoints stay identical
+        # regardless of flags) -- only their OUTPUT is zeroed, which also
+        # zeroes their gradient, so this doubles as an ablation-training
+        # knob, not just an eval-time one.
+        self.use_mdff = use_mdff
+        self.use_gsefe = use_gsefe
 
 
 
@@ -273,12 +284,19 @@ class LBMSSAM2Integration(nn.Module):
                 gsefe_output, size=target_hw, mode="bilinear", align_corners=False
             )
 
+        if not self.use_gsefe:
+            gsefe_output = torch.zeros_like(gsefe_output)
+
+
         '''MDFF'''
         mdff_output = self.mdff(hierarchical_features)
         if mdff_output.shape[-2:] != target_hw:
             mdff_output = F.interpolate(
                 mdff_output, size=target_hw, mode="bilinear", align_corners=False
             )
+        if not self.use_mdff:
+            mdff_output = torch.zeros_like(mdff_output)
+
 
         '''Feature Fusion'''
         lbms_masks_tensor, lbms_scores_tensor = self._fuse_lbms_masks(
@@ -323,6 +341,8 @@ class LBMSSAM2Integration(nn.Module):
                 gsefe_output, size=target_hw, mode="bilinear", align_corners=False
             )
         
+        if not self.use_gsefe:
+            gsefe_output = torch.zeros_like(gsefe_output)
     
         '''MDFF'''
         # FIX #2 continued: pull raw stage outputs from the trunk directly,
@@ -334,6 +354,8 @@ class LBMSSAM2Integration(nn.Module):
             mdff_output = F.interpolate(
                 mdff_output, size=target_hw, mode="bilinear", align_corners=False
             )
+        if not self.use_mdff:
+            mdff_output = torch.zeros_like(mdff_output)
 
         multimask_output = prompts.get("multimask_output", True)
         '''
@@ -378,20 +400,6 @@ class LBMSSAM2Integration(nn.Module):
  
         return sam_masks, scores, logits, mask_feats, mask_channels, lbms_mask_np, lbms_score_np
 
-        
-@dataclass 
-class LBMSTrainOutput:
-    """
-    forward_train()'s return type. `masks`/`iou_pred` are named to match
-    what TrainingEval.combined_loss (lbms_sam_main.py) reads via attribute
-    access -- unlike forward()'s inference-only return tuple, everything
-    here is still attached to the autograd graph (no .detach()/.numpy()).
-    """
-    masks: torch.Tensor        # (B, N, H, W) LBMS mask logits, gt-resolution
-    iou_pred: torch.Tensor     # (B, N) LBMS stability scores
-    sam_masks: torch.Tensor    # (B, N, H, W) frozen SAM masks (logits or bool), for reference
-    sam_scores: torch.Tensor   # (B, N) frozen SAM iou predictions
-    mask_feats: torch.Tensor   # (B, C, h, w) SAM decoder's upscaled mask features
 
 
         

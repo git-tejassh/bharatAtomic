@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tifffile
 import os
-from typing import Optional, Callable
+from typing import Optional, Callable, Sequence
 from patchify import patchify  #Only to handle large images
 import random
 from scipy import ndimage
@@ -266,6 +266,35 @@ def show_points(coords, labels, ax, marker_size=375):
     neg_points = coords[labels==0]
     ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
     ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
+
+
+def plot_loss_history(history: dict, title_prefix: str = "LBMS-SAM Adapter"):
+    """
+    P6: the ad hoc notebook version of this plot hardcoded both the x-axis
+    range (`np.arange(50)`) and the title text ("...: 50 Epochs") as two
+    separate literals that have to be kept in sync by hand with whatever
+    `num_epochs` a given training run actually used -- easy to silently drift
+    if the notebook cell is reused for a different-length run without editing
+    both spots (a provenance risk when the plot is later used to support a
+    convergence claim). Deriving both from `len(history["train_loss"])`
+    makes that class of mismatch impossible.
+    """
+    n_epochs = len(history["train_loss"])
+    epochs = np.arange(1, n_epochs + 1)
+
+    plt.figure(figsize=[15, 10])
+    plt.plot(epochs, history["train_loss"], label="Train Loss", color="blue", linestyle="-", linewidth=2)
+    if history.get("val_loss"):
+        plt.plot(epochs[: len(history["val_loss"])], history["val_loss"], label="Val Loss", color="red", linestyle="-", linewidth=2)
+    plt.xlabel("Epoch", size=24)
+    plt.ylabel("Loss", size=24)
+    plt.title(f"Training V/s Val Loss for {title_prefix}: {n_epochs} Epochs", loc="center", y=0.8, size=24)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+
 
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
@@ -638,6 +667,50 @@ def build_dataloader(
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
  
 
+# P1 item 3: these are the two low-dimensional parameter groups the
+# post-100-epoch checkpoint diff flagged as moving disproportionately far
+# relative to the rest of the ~1.3M trainable params (mdff.denoise_*.threshold
+# collapsed to one effective scalar; gsefe.to_gray.weight moved Δ=1.03 vs a
+# conv-stack max of Δ=0.29). Both have very few scalars (32 per threshold
+# tensor, `in_channels` for to_gray), so a normal LR gives them disproportionately
+# large effective steps. Match substrings against parameter names rather than
+# module identity so this keeps working if the module tree is refactored.
+LOW_LR_PARAM_KEYWORDS = (
+    "denoise_lh.threshold",
+    "denoise_hl.threshold",
+    "denoise_hh.threshold",
+    "to_gray.weight",
+)
+
+
+def build_param_groups(
+    model: nn.Module,
+    base_lr: float = 1e-4,
+    low_lr_scale: float = 0.1,
+    low_lr_keywords: Sequence[str] = LOW_LR_PARAM_KEYWORDS,
+) -> list:
+    """
+    Splits model's trainable params into a base-LR group and a low-LR group
+    (matched by substring on parameter name -- see LOW_LR_PARAM_KEYWORDS).
+    Returns AdamW-style param-group dicts. Pulled out as a standalone,
+    model-structure-agnostic function so it's unit-testable without a real
+    SAM2/LBMS model instance.
+    """
+    base_params, low_lr_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(k in name for k in low_lr_keywords):
+            low_lr_params.append(param)
+        else:
+            base_params.append(param)
+
+    groups = [{"params": base_params, "lr": base_lr}]
+    if low_lr_params:
+        groups.append({"params": low_lr_params, "lr": base_lr * low_lr_scale})
+    return groups
+
+
 
 class TrainingEval:
     def __init__(
@@ -645,11 +718,12 @@ class TrainingEval:
         model,
         loss_fn: Optional[Callable] = None,
         device: str = "cpu",
+        base_lr: float = 1e-4,
+        low_lr_scale: float = 0.1
         ):
         
         self.model = model
-        self.optimizer = optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+        self.optimizer = optim.AdamW(build_param_groups(model, base_lr=base_lr, low_lr_scale=low_lr_scale))
         self.device = device
  
         self.mask_loss_fn = LBMS_MaskLoss(lambda_dice=1.0, lambda_focal=1.0, lambda_bce=1.0)
@@ -992,12 +1066,22 @@ class TrainingEval:
 
 
 
-def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_image: Optional[int] = None):
+    @staticmethod
+    @torch.no_grad()
+    def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_image: Optional[int] = None):
         """
         Correct dataset-scale LBMS-SAM vs frozen-SAM2 comparison. Pairing is
         guaranteed because lbms_sam.forward() returns both models' masks from
         a single call on the same image/point -- no separate loader passes,
         no risk of index misalignment.
+
+        NOTE (P4): this selects each model's mask via its OWN self-reported
+        score (argmax sam_scores / lbms_scores) -- this is the "deployed"
+        metric, not "oracle" (best mask vs GT). It is NOT directly comparable
+        to a best-of-3-vs-GT sweep unless the sweep also runs over every
+        instance in this same annotations.json at this same native
+        resolution -- see `benchmark_selection_analysis` below, which reports
+        both oracle and self-score IoU from a single identical pass.
         """
         ann_file = os.path.join(coco_root_dir, "annotations.json")
         img_dir = os.path.join(coco_root_dir, "img")
@@ -1043,4 +1127,145 @@ def benchmark_test_set_coco(lbms_sam, coco_root_dir: str, max_instances_per_imag
                 sam_ious.append(sam_iou)
 
         return np.array(lbms_ious), np.array(sam_ious)
+    
+        @torch.no_grad()
+        def print_threshold_diagnostics(self) -> dict:
+            """
+            P1 item 1: reports MDFF's per-sub-band, per-channel threshold spread
+            so a collapsed ("~0.04-wide band", i.e. behaving like one shared
+            scalar instead of 32 differentiated thresholds) vs. genuinely
+            differentiated state can be told apart at a glance. Call this after
+            training (or periodically during it) -- it's cheap (no forward pass).
+            """
+            mdff = getattr(self.model, "mdff", None)
+            if mdff is None or not hasattr(mdff, "threshold_diagnostics"):
+                raise AttributeError("self.model has no .mdff.threshold_diagnostics() -- wrong model type?")
+            diag = mdff.threshold_diagnostics()
+            for band, stats in diag.items():
+                print(f"  mdff.denoise_{band}.threshold: mean={stats['mean']:.4f} "
+                    f"std={stats['std']:.4f} range=[{stats['min']:.4f}, {stats['max']:.4f}]")
+            return diag
+
+
+def _iou_np(pred: np.ndarray, gt: np.ndarray) -> float:
+    pred, gt = pred.astype(bool), gt.astype(bool)
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    return float(inter / union) if union > 0 else 0.0
+
+
+def texture_density(image: np.ndarray, gt_mask: np.ndarray) -> float:
+    """
+    Laplacian-variance texture-density score for one instance, cropped to
+    the GT mask's bounding box -- P1 item 4 / P7's "texture-density-stratified
+    oracle IoU" diagnostic. Higher = busier/spikier local texture, the regime
+    where the MDFF mask-hole artifact concentrates.
+    """
+    ys, xs = np.where(gt_mask)
+    if ys.size == 0:
+        return 0.0
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    crop = image[y0:y1, x0:x1]
+    if crop.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def benchmark_selection_analysis(
+    lbms_sam,
+    coco_root_dir: str,
+    max_instances_per_image: Optional[int] = None,
+):
+    """
+    Canonical, single-pass, all-instance, native-resolution evaluation.
+    Separates MASK QUALITY from SELECTOR QUALITY, and records a per-instance
+    texture-density score for stratified analysis. For each instance,
+    for both LBMS and baseline SAM2:
+      - oracle IoU    = best of the 3 candidate masks vs GT (mask quality)
+      - self-score IoU = IoU of the mask the model's own score picks (deployed quality)
+
+    `coco_root_dir` follows the SAME convention as build_dataloader/
+    benchmark_test_set_coco elsewhere in this file: it must be the split
+    folder itself (containing annotations.json + img/ directly), e.g.
+    ".../COCO_format/test_dir" -- NOT its parent. (P4: an earlier ad hoc
+    version of this function, kept only in the notebook, took the *parent*
+    COCO_format dir and hardcoded a "test_dir/annotations.json" suffix --
+    a second, independent calling-convention mismatch on top of the
+    resolution/instance-count one, which made numbers from different eval
+    scripts non-comparable by construction. Standardizing on one convention
+    here removes that confound.)
+
+    Returns (rec, img_names) where rec is a dict of np.arrays with keys
+    oracle_lbms, oracle_sam, self_lbms, self_sam, texture_density -- all the
+    same length and index-aligned to img_names (one entry per instance).
+    """
+    ann_file = os.path.join(coco_root_dir, "annotations.json")
+    img_dir = os.path.join(coco_root_dir, "img")
+    coco = COCO(ann_file)
+
+    rec = {"oracle_lbms": [], "oracle_sam": [], "self_lbms": [], "self_sam": [], "texture_density": []}
+    img_names = []
+
+    for img_id in coco.imgs:
+        info = coco.imgs[img_id]
+        image = cv2.cvtColor(cv2.imread(os.path.join(img_dir, info["file_name"])), cv2.COLOR_BGR2RGB)
+        img_name = os.path.join(img_dir, info["file_name"])
+        lbms_sam.set_image(image)
+
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=img_id))
+        if max_instances_per_image is not None:
+            anns = anns[:max_instances_per_image]
+
+        for ann in anns:
+            gt = mask_utils.decode(ann["segmentation"]).astype(np.uint8)
+            if not gt.any():
+                continue
+            px, py = sample_point_prompt(gt)
+
+            (sam_masks, sam_scores, _, _, _,
+             lbms_masks, lbms_scores) = lbms_sam.forward(prompts={
+                "point_coords": np.array([[px, py]]),
+                "point_labels": np.array([1]),
+                "multimask_output": True,
+            })
+
+            img_names.append(img_name)
+
+            sam_ious = np.array([_iou_np(sam_masks[i], gt) for i in range(len(sam_masks))])
+            lbms_ious = np.array([_iou_np(lbms_masks[i], gt) for i in range(len(lbms_masks))])
+
+            rec["oracle_sam"].append(sam_ious.max())
+            rec["oracle_lbms"].append(lbms_ious.max())
+            rec["self_sam"].append(sam_ious[int(np.argmax(sam_scores))])
+            rec["self_lbms"].append(lbms_ious[int(np.argmax(lbms_scores))])
+            rec["texture_density"].append(texture_density(image, gt))
+
+    return {k: np.array(v) for k, v in rec.items()}, img_names
+
+
+def stratify_by_texture(rec: dict, num_buckets: int = 4) -> None:
+    """
+    P1 item 4 / P7: buckets `benchmark_selection_analysis`'s output by
+    texture-density quantile and prints the oracle IoU gap (LBMS - SAM) per
+    bucket. Confirms (or refutes) that LBMS's deficit concentrates in
+    high-texture instances, and is cheap enough to run as a standing
+    diagnostic on every eval pass rather than a one-off check -- a full-epoch
+    aggregate pixel loss (P7) averages this artifact away entirely.
+    """
+    density = rec["texture_density"]
+    edges = np.quantile(density, np.linspace(0, 1, num_buckets + 1))
+    for i in range(num_buckets):
+        lo, hi = edges[i], edges[i + 1]
+        in_bucket = (density >= lo) & (density <= hi if i == num_buckets - 1 else density < hi)
+        if not in_bucket.any():
+            print(f"  bucket {i + 1}/{num_buckets} [{lo:.1f}, {hi:.1f}): empty")
+            continue
+        lbms_mean = rec["oracle_lbms"][in_bucket].mean()
+        sam_mean = rec["oracle_sam"][in_bucket].mean()
+        print(
+            f"  bucket {i + 1}/{num_buckets} texture=[{lo:.1f}, {hi:.1f}) "
+            f"n={in_bucket.sum()}: LBMS {lbms_mean:.4f} vs SAM {sam_mean:.4f} "
+            f"(Δ {lbms_mean - sam_mean:+.4f})"
+        )
  
