@@ -305,8 +305,8 @@ class SAM2ImagePredictor:
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
 
-        prediction_time = time.time() - start_time
-        print(f'Inference Time: {prediction_time}')
+        prediction_time = (time.time() - start_time)*1000
+        print(f'Inference Time: {prediction_time:.4f}')
         
         return masks_np, iou_predictions_np, low_res_masks_np, to_fuse_from_sam, mask_channels, output_tokens
 
