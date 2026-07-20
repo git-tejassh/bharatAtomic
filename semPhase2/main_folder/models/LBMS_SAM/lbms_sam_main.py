@@ -24,6 +24,7 @@ from torch.utils.data import Dataset, DataLoader
 from pycocotools.coco import COCO
 from PIL.Image import Image
 from lbms_mask_loss import LBMS_MaskLoss
+from lbms_sam_integration import compute_batch_iou_targets
 import torch.nn.functional as F
 
 path = '/Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/emps_dataset/emps-DatasetNinja (2)/ds/' 
@@ -824,9 +825,13 @@ class TrainingEval:
         best_iou_pred = iou_pred[batch_idx, best_idx].unsqueeze(1)     # (B,1)
         best_actual_iou = ious[batch_idx, best_idx].unsqueeze(1)       # (B,1)
  
+        iou_targets = compute_batch_iou_targets(train_output.masks, gt_masks)  # detached target
+        iou_loss = F.mse_loss(train_output.iou_pred, iou_targets)
+
         mask_loss = self.mask_loss_fn(best_mask, gt)
+        total_loss = mask_loss + iou_loss_weight * iou_loss
         # iou_loss = F.mse_loss(best_iou_pred, best_actual_iou)
-        return self.mask_loss_fn(best_mask, gt)
+        return total_loss
  
  
     @torch.no_grad()

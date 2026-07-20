@@ -105,7 +105,14 @@ class LBMSSAM2Integration(nn.Module):
         # (112/224/448/896) that MDFF's in_dims assumes. The trunk's raw
         # stage outputs are what we actually want.
 
-        self.image_encoder = self.sam2.model.image_encoder
+        self.image_encoder = self.sam2.model
+        
+        self.lbms_iou_head = nn.Sequential(
+            nn.Linear(token_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid()          # output in [0, 1]
+            )
 
     def _preprocess_gsefe_input(self, image_np):
         """
@@ -192,7 +199,7 @@ class LBMSSAM2Integration(nn.Module):
             flat = lbms_mask_i.flatten(-2)                # (B, H*W)
             area_i = (flat > delta).float().sum(-1)
             area_u = (flat > -delta).float().sum(-1)
-            score_i = torch.where(area_u > 0, area_i / area_u, torch.ones_like(area_i))
+            score_i = self.lbms_iou_head(token).squeeze(-1)
 
             lbms_masks_list.append(lbms_mask_i)
             lbms_scores_list.append(score_i)
@@ -200,6 +207,18 @@ class LBMSSAM2Integration(nn.Module):
         lbms_masks_tensor = torch.stack(lbms_masks_list, dim=1)   # (B, N, H, W)
         lbms_scores_tensor = torch.stack(lbms_scores_list, dim=1) # (B, N)
         return lbms_masks_tensor, lbms_scores_tensor
+    
+    @torch.no_grad()
+    def compute_batch_iou_targets(pred_masks_logits, gt_masks, threshold=0.0):
+        """
+        pred_masks_logits: (B, N, H, W) LBMS mask logits (gt-resolution, from LBMSTrainOutput.masks)
+        gt_masks:          (B, N, H, W) or (B, 1, H, W) broadcastable binary ground truth
+        Returns: (B, N) real IoU per candidate mask, detached -- this is a target, not a loss term.
+        """
+        pred_bin = (pred_masks_logits > threshold).float()
+        intersection = (pred_bin * gt_masks).sum(dim=(-2, -1))
+        union = ((pred_bin + gt_masks) > 0).float().sum(dim=(-2, -1))
+        return torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
 
     def forward_train(self, images, point_coords, point_labels, multimask_output=True):
         """
@@ -361,16 +380,12 @@ class LBMSSAM2Integration(nn.Module):
         '''
         WHEN ENOUGH DATA (GROUND TRUTH) IS AVAILABLE, ADD A TRAINABLE IOU HEAD TO PREDICT THE QUALITY OF THE LBMS MASKS, 
         SIMILAR TO SAM'S IOU HEAD. THIS WILL ALLOW US TO SELECT THE BEST MASK AMONG MULTIPLE OUTPUTS.
-        self.lbms_iou_head = nn.Sequential(
-            nn.Linear(token_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Sigmoid()          # output in [0, 1]
-            )
+        '''
+        
 
         # In forward(), after fusion:
         lbms_score = self.lbms_iou_head(output_tokens_fused).squeeze(-1)  # (B,)
-        '''
+    
 
         lbms_masks_tensor, lbms_scores_tensor = self._fuse_lbms_masks(
             mask_feats, mdff_output, gsefe_output, output_tokens, multimask_output
