@@ -105,7 +105,7 @@ class LBMSSAM2Integration(nn.Module):
         # (112/224/448/896) that MDFF's in_dims assumes. The trunk's raw
         # stage outputs are what we actually want.
 
-        self.image_encoder = self.sam2.model
+        self.image_encoder = self.sam2.model.image_encoder
         
         self.lbms_iou_head = nn.Sequential(
             nn.Linear(token_dim, 256),
@@ -383,8 +383,7 @@ class LBMSSAM2Integration(nn.Module):
         '''
         
 
-        # In forward(), after fusion:
-        lbms_score = self.lbms_iou_head(output_tokens_fused).squeeze(-1)  # (B,)
+        
     
 
         lbms_masks_tensor, lbms_scores_tensor = self._fuse_lbms_masks(

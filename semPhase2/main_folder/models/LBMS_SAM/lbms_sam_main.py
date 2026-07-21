@@ -24,7 +24,8 @@ from torch.utils.data import Dataset, DataLoader
 from pycocotools.coco import COCO
 from PIL.Image import Image
 from lbms_mask_loss import LBMS_MaskLoss
-from lbms_sam_integration import compute_batch_iou_targets
+import lbms_sam_integration
+
 import torch.nn.functional as F
 
 path = '/Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/emps_dataset/emps-DatasetNinja (2)/ds/' 
@@ -798,12 +799,26 @@ class TrainingEval:
         return intersection / (union + eps)
  
  
+    @torch.no_grad()
+    def compute_batch_iou_targets(self, pred_masks_logits, gt_masks, threshold=0.0):
+        """
+        pred_masks_logits: (B, N, H, W) LBMS mask logits (gt-resolution, from LBMSTrainOutput.masks)
+        gt_masks:          (B, N, H, W) or (B, 1, H, W) broadcastable binary ground truth
+        Returns: (B, N) real IoU per candidate mask, detached -- this is a target, not a loss term.
+        """
+        pred_bin = (pred_masks_logits > threshold).float()
+        intersection = (pred_bin * gt_masks).sum(dim=(-2, -1))
+        union = ((pred_bin + gt_masks) > 0).float().sum(dim=(-2, -1))
+        return torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
+
     def combined_loss(self, outputs, batch):
         """
         Default loss_fn. Picks the best of the multimask_output=True mask
         heads per-sample (highest actual IoU vs. gt), matching SAM's own
         training recipe, instead of always training mask head 0.
         """
+
+        iou_loss_weight = 0.7
         gt = batch["gt_mask"]
         if gt.dim() == 3:
             gt = gt.unsqueeze(1)                      # (B,H,W) -> (B,1,H,W)
@@ -825,8 +840,8 @@ class TrainingEval:
         best_iou_pred = iou_pred[batch_idx, best_idx].unsqueeze(1)     # (B,1)
         best_actual_iou = ious[batch_idx, best_idx].unsqueeze(1)       # (B,1)
  
-        iou_targets = compute_batch_iou_targets(train_output.masks, gt_masks)  # detached target
-        iou_loss = F.mse_loss(train_output.iou_pred, iou_targets)
+        iou_targets = self.compute_batch_iou_targets(pred_masks, gt_expanded)  # detached target
+        iou_loss = F.mse_loss(iou_pred, iou_targets)
 
         mask_loss = self.mask_loss_fn(best_mask, gt)
         total_loss = mask_loss + iou_loss_weight * iou_loss
