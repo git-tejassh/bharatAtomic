@@ -110,8 +110,11 @@ class LBMSSAM2Integration(nn.Module):
         self.lbms_iou_head = nn.Sequential(
             nn.Linear(token_dim, 256),
             nn.ReLU(),
-            nn.Linear(256, 1),
-            nn.Sigmoid()          # output in [0, 1]
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256 , 1),
+            nn.Sigmoid(),       # output in [0, 1]
             )
 
     def _preprocess_gsefe_input(self, image_np):

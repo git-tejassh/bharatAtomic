@@ -818,7 +818,7 @@ class TrainingEval:
         training recipe, instead of always training mask head 0.
         """
 
-        iou_loss_weight = 0.7
+        iou_loss_weight = 10
         gt = batch["gt_mask"]
         if gt.dim() == 3:
             gt = gt.unsqueeze(1)                      # (B,H,W) -> (B,1,H,W)
@@ -845,6 +845,7 @@ class TrainingEval:
 
         mask_loss = self.mask_loss_fn(best_mask, gt)
         total_loss = mask_loss + iou_loss_weight * iou_loss
+        print(f"mask_loss={mask_loss.item():.4f}  iou_loss(raw)={iou_loss.item():.4f}")
         # iou_loss = F.mse_loss(best_iou_pred, best_actual_iou)
         return total_loss
  
