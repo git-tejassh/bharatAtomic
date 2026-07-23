@@ -684,6 +684,8 @@ LOW_LR_PARAM_KEYWORDS = (
     "denoise_hl.threshold",
     "denoise_hh.threshold",
     "to_gray.weight",
+    "raw_logit_scale",
+    "logit_bias",
 )
 
 
@@ -1194,6 +1196,42 @@ def texture_density(image: np.ndarray, gt_mask: np.ndarray) -> float:
     gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
+def _mask_to_boundary(mask: np.ndarray, dilation_ratio: float = 0.02) -> np.ndarray:
+    mask = mask.astype(np.uint8)
+    h, w = mask.shape
+    img_diag = float(np.sqrt(h ** 2 + w ** 2))
+    dilation = max(1, int(round(dilation_ratio * img_diag)))
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    eroded = cv2.erode(padded, kernel, iterations=dilation)
+    eroded = eroded[1:h + 1, 1:w + 1]
+    return mask - eroded
+
+
+def boundary_iou(pred_mask: np.ndarray, gt_mask: np.ndarray, dilation_ratio: float = 0.02) -> float:
+    pred_b = _mask_to_boundary(pred_mask, dilation_ratio)
+    gt_b = _mask_to_boundary(gt_mask, dilation_ratio)
+    inter = np.logical_and(pred_b, gt_b).sum()
+    union = np.logical_or(pred_b, gt_b).sum()
+    return float(inter / union) if union > 0 else 0.0
+
+
+def instance_density_bucket(ann: dict, decoded_masks: dict, dilate_px: int = 5) -> str:
+    this_mask = decoded_masks[ann["id"]]
+    kernel = np.ones((dilate_px, dilate_px), np.uint8)
+    this_dilated = cv2.dilate(this_mask, kernel)
+    neighbor_count = 0
+    for other_id, other_mask in decoded_masks.items():
+        if other_id == ann["id"]:
+            continue
+        if np.logical_and(this_dilated, other_mask).any():
+            neighbor_count += 1
+    if neighbor_count == 0:
+        return "isolated"
+    elif neighbor_count <= 2:
+        return "touching"
+    else:
+        return "heavily_overlapping"
 
 def benchmark_selection_analysis(
     lbms_sam,
@@ -1227,7 +1265,13 @@ def benchmark_selection_analysis(
     img_dir = os.path.join(coco_root_dir, "img")
     coco = COCO(ann_file)
 
-    rec = {"oracle_lbms": [], "oracle_sam": [], "self_lbms": [], "self_sam": [], "texture_density": []}
+    rec = {
+        "oracle_lbms": [], "oracle_sam": [],
+        "self_lbms": [], "self_sam": [],
+        "oracle_biou_lbms": [], "oracle_biou_sam": [],
+        "self_biou_lbms": [], "self_biou_sam": [],
+        "texture_density": [], "instance_density": [],
+        }
     img_names = []
 
     for img_id in coco.imgs:
@@ -1240,8 +1284,10 @@ def benchmark_selection_analysis(
         if max_instances_per_image is not None:
             anns = anns[:max_instances_per_image]
 
+        decoded_masks = {a["id"]: mask_utils.decode(a["segmentation"]).astype(np.uint8) for a in anns}
+
         for ann in anns:
-            gt = mask_utils.decode(ann["segmentation"]).astype(np.uint8)
+            gt = decoded_masks[ann["id"]]
             if not gt.any():
                 continue
             px, py = sample_point_prompt(gt)
@@ -1258,13 +1304,43 @@ def benchmark_selection_analysis(
             sam_ious = np.array([_iou_np(sam_masks[i], gt) for i in range(len(sam_masks))])
             lbms_ious = np.array([_iou_np(lbms_masks[i], gt) for i in range(len(lbms_masks))])
 
-            rec["oracle_sam"].append(sam_ious.max())
-            rec["oracle_lbms"].append(lbms_ious.max())
-            rec["self_sam"].append(sam_ious[int(np.argmax(sam_scores))])
-            rec["self_lbms"].append(lbms_ious[int(np.argmax(lbms_scores))])
+            sam_oracle_idx = int(sam_ious.argmax())
+            lbms_oracle_idx = int(lbms_ious.argmax())
+            sam_self_idx = int(np.argmax(sam_scores))
+            lbms_self_idx = int(np.argmax(lbms_scores))
+
+            rec["oracle_sam"].append(sam_ious[sam_oracle_idx])
+            rec["oracle_lbms"].append(lbms_ious[lbms_oracle_idx])
+            rec["self_sam"].append(sam_ious[sam_self_idx])
+            rec["self_lbms"].append(lbms_ious[lbms_self_idx])
+
+            rec["oracle_biou_sam"].append(boundary_iou(sam_masks[sam_oracle_idx], gt))
+            rec["oracle_biou_lbms"].append(boundary_iou(lbms_masks[lbms_oracle_idx], gt))
+            rec["self_biou_sam"].append(boundary_iou(sam_masks[sam_self_idx], gt))
+            rec["self_biou_lbms"].append(boundary_iou(lbms_masks[lbms_self_idx], gt))
+
             rec["texture_density"].append(texture_density(image, gt))
+            rec["instance_density"].append(instance_density_bucket(ann, decoded_masks))
 
     return {k: np.array(v) for k, v in rec.items()}, img_names
+
+
+def stratify_by_instance_density(rec: dict) -> None:
+    density = rec["instance_density"]
+    for bucket in ("isolated", "touching", "heavily_overlapping"):
+        in_bucket = density == bucket
+        n = int(in_bucket.sum())
+        if n == 0:
+            print(f"  {bucket:<20} empty")
+            continue
+        oracle_gap = rec["oracle_lbms"][in_bucket].mean() - rec["oracle_sam"][in_bucket].mean()
+        self_gap = rec["self_lbms"][in_bucket].mean() - rec["self_sam"][in_bucket].mean()
+        biou_gap = rec["self_biou_lbms"][in_bucket].mean() - rec["self_biou_sam"][in_bucket].mean()
+        print(
+            f"  {bucket:<20} n={n:<5} "
+            f"oracle IoU Δ={oracle_gap:+.4f}  deployed IoU Δ={self_gap:+.4f}  "
+            f"deployed BIoU Δ={biou_gap:+.4f}"
+        )
 
 
 def stratify_by_texture(rec: dict, num_buckets: int = 4) -> None:

@@ -129,6 +129,18 @@ class GSEFE(nn.Module):
         super().__init__()
         self.to_gray = nn.Conv2d(in_channels, 1, kernel_size=1, bias=False)
 
+        # FIX (to_gray.weight anomaly): to_gray only has 3 scalar parameters,
+        # so gradient concentrates onto them instead of spreading across a
+        # normal conv's weights. Grayscale conversion has a well-established
+        # correct answer (ITU-R BT.601 luma), so freeze it there instead of
+        # leaving it to drift.
+        if in_channels == 3:
+            with torch.no_grad():
+                self.to_gray.weight.copy_(
+                    torch.tensor([0.299, 0.587, 0.114])[None, :, None, None]
+                )
+            self.to_gray.weight.requires_grad_(False)
+
         sobel_x, sobel_y = build_sobel_kernels()
         self.register_buffer("sobel_x", sobel_x)
         self.register_buffer("sobel_y", sobel_y)
@@ -165,7 +177,6 @@ class GSEFE(nn.Module):
 
         x = torch.cat([sobel_mag, gabor_resp], dim=1)  # (B,5,H,W)
         return self.feature_enhancement(x)
-
 
 # ---------------------------------------------------------------------------
 # Haar DWT / IDWT -- the actual wavelet transform used in the diagram's
@@ -427,6 +438,11 @@ class FeatureFusion(nn.Module):
             nn.Linear(token_dim, mask_feat_channels),
         )
 
+        # Learnable post-hoc calibration of the raw logit map. Bounded via
+        # softplus so it can't drift negative and silently invert every mask.
+        self.raw_logit_scale = nn.Parameter(torch.tensor(0.5413))  # softplus(0.5413) ≈ 1.0
+        self.logit_bias = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, mask_feat, denoised_feat, edge_feat, output_token):
         # all three spatial inputs must already match mask_feat's H, W, C
         # (resizing/projection happens upstream, NOT here)
@@ -435,9 +451,10 @@ class FeatureFusion(nn.Module):
 
         weights = self.token_mlp(output_token)      # (B, C)
         mask = torch.einsum('bchw,bc->bhw', fused, weights)  # channel-contracting dot product
+
+        logit_scale = F.softplus(self.raw_logit_scale)
+        mask = logit_scale * mask + self.logit_bias
         return mask  # (B, H, W) — already at mask_feat's resolution, no upsampling needed
-
-
 class LBMSSamHead(nn.Module):
     """
     Trainable head combining GSEFE + MDFF + FeatureFusion. This is everything
