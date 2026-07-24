@@ -49,10 +49,18 @@ def _filename_to_image_id(gt_json_path: str) -> dict:
     return {img["file_name"]: img["id"] for img in gt["images"]}
 
 
-def get_yolo_predictions(model, image_dir: str, gt_json_path: str, category_id: int = 1, device=None) -> list[dict]:
+def get_yolo_predictions(model, image_dir: str, gt_json_path: str, category_id: int = 1, device=None, conf: float = 0.001) -> list[dict]:
     """model: an ultralytics.YOLO instance with weights already loaded.
     Uses results[i].masks.xy (already in original-image pixel coordinates),
     so no mask-rasterize/re-extract-contour round trip is needed here.
+
+    conf defaults to 0.001, NOT Ultralytics' predict()-default of 0.25 --
+    ultralytics.val() internally uses ~0.001 specifically so it can build
+    the full precision-recall curve; collecting at predict()'s default 0.25
+    silently drops every detection below that score before pycocotools ever
+    sees it, capping achievable recall/AP regardless of what the model can
+    actually do. This mirrors the same fix already applied to the RF-DETR
+    adapter (threshold=0.01) -- keep them at the same order of magnitude.
     """
     filename_to_id = _filename_to_image_id(gt_json_path)
     image_paths = sorted(p for p in Path(image_dir).iterdir() if p.suffix.lower() in _IMG_EXTS)
@@ -63,7 +71,7 @@ def get_yolo_predictions(model, image_dir: str, gt_json_path: str, category_id: 
         if image_id is None:
             continue  # image not in this GT split -- skip rather than silently mismatch ids
 
-        predict_kwargs = {"verbose": False}
+        predict_kwargs = {"verbose": False, "conf": conf}
         if device is not None:
             predict_kwargs["device"] = device
         preds = model.predict(str(img_path), **predict_kwargs)[0]
@@ -194,11 +202,11 @@ def _print_report(name: str, bbox_stats: dict, segm_stats: dict, f1_result: tupl
 # Orchestrator -- the one function you call from the notebook.
 # ---------------------------------------------------------------------------
 
-def evaluate(model, image_dir: str, gt_json_path: str, category_id: int = 1, device=None) -> dict:
+def evaluate(model, image_dir: str, gt_json_path: str, category_id: int = 1, device=None, conf: float = 0.001) -> dict:
     """Runs bbox eval, segm eval, and the F1 sweep, prints a report, and
     returns everything as a dict for programmatic use (e.g. density
     stratification later)."""
-    dt_results = get_yolo_predictions(model, image_dir, gt_json_path, category_id=category_id, device=device)
+    dt_results = get_yolo_predictions(model, image_dir, gt_json_path, category_id=category_id, device=device, conf=conf)
 
     bbox_stats = run_coco_eval(gt_json_path, dt_results, iou_type="bbox")
     segm_stats = run_coco_eval(gt_json_path, dt_results, iou_type="segm")
