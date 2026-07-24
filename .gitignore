@@ -52,6 +52,7 @@ bA_rfdetr/
 *.png.json
 *.png
 *.webp
+*.txt
 
 dataset/
 datasets/
