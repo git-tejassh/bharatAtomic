@@ -1,0 +1,6 @@
+path: /Users/tjsss/Desktop/bharatAtomic/semPhase2/main_folder/canonical_split_v1/yolo
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: particle
