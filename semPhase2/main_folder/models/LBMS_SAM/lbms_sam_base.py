@@ -454,7 +454,9 @@ class FeatureFusion(nn.Module):
 
         logit_scale = F.softplus(self.raw_logit_scale)
         mask = logit_scale * mask + self.logit_bias
-        return mask  # (B, H, W) — already at mask_feat's resolution, no upsampling needed
+
+        pooled_fused = fused.mean(dim = (-2,-1))
+        return mask , pooled_fused # (B, H, W) — already at mask_feat's resolution, no upsampling needed
 class LBMSSamHead(nn.Module):
     """
     Trainable head combining GSEFE + MDFF + FeatureFusion. This is everything

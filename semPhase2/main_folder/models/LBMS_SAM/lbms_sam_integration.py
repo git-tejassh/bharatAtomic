@@ -108,7 +108,7 @@ class LBMSSAM2Integration(nn.Module):
         self.image_encoder = self.sam2.model.image_encoder
         
         self.lbms_iou_head = nn.Sequential(
-            nn.Linear(token_dim, 256),
+            nn.Linear(token_dim + mask_feat_channels, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 256),
@@ -194,15 +194,16 @@ class LBMSSAM2Integration(nn.Module):
 
         for tok_idx in tok_range:
             token = output_tokens[:, tok_idx, :]          # (B, 256)
-            lbms_mask_i = self.fusion(
+            lbms_mask_i , pooled_fused_i = self.fusion(
                 mask_feats, mdff_output, gsefe_output, token
             )                                              # (B, H_latent, W_latent)
 
+            score_input = torch.cat([token, pooled_fused_i], dim=-1)
             # Stability score per mask
             flat = lbms_mask_i.flatten(-2)                # (B, H*W)
             area_i = (flat > delta).float().sum(-1)
             area_u = (flat > -delta).float().sum(-1)
-            score_i = self.lbms_iou_head(token).squeeze(-1)
+            score_i = self.lbms_iou_head(score_input).squeeze(-1)
 
             lbms_masks_list.append(lbms_mask_i)
             lbms_scores_list.append(score_i)
